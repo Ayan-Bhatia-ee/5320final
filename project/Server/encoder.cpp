@@ -12,6 +12,7 @@
 //
 // Sources: SHA-256 follows FIPS 180-4; LZW follows the standard algorithm in the project
 // handout, adapted to the provided decoder (13-bit fixed codes, no end code).
+// test
 
 #include "encoder.h"
 
