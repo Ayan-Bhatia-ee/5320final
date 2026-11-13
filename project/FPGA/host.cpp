@@ -261,6 +261,9 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 
 	cl_int err;
 	cl::Event kev;
+	const uint32_t count_sentinel = 0xA5A55A5Au;
+	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(
+			Fpga->count_buf, CL_FALSE, 0, sizeof(count_sentinel), &count_sentinel));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(3, len));
 	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf, CL_FALSE, 0, len, in));
 	OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
@@ -279,7 +282,12 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 
 	// len bytes give at most len codes of 13 bits; at least one code (2 bytes) for len >= 1
 	if (count < 2 || count > (CODE_LENGTH * len + 7) / 8) {
-		fprintf(stderr, "FPGA LZW returned invalid payload size %u for %u input bytes\n", count, len);
+		fprintf(stderr,
+		        "FPGA LZW returned invalid payload size %u (0x%08x) for %u input bytes; "
+		        "kernel event %.1f us%s\n",
+		        count, count, len, (t1 - t0) / 1e3,
+		        count == count_sentinel ? "; payload_bytes was not written" :
+		        count == 0 ? "; kernel wrote zero (length was seen as 0 or > LZW_MAX_INPUT)" : "");
 		// Release the XRT buffers explicitly instead of making zocl tear them down from
 		// process-exit cleanup.  The board log shows that cleanup path corrupting mm state.
 		opencl_shutdown();
