@@ -17,7 +17,7 @@ help:
 	@echo "      Run ./encoder -x lzw.xclbin [output_file] for FPGA LZW."
 	@echo ""
 	@echo "  make lzw-test / make lzw-cosim"
-	@echo "      Run the native kernel tests / Vitis HLS simulation and co-simulation."
+	@echo "      Run the native kernel tests / native tests followed by synthesis and RTL co-simulation."
 	@echo ""
 	@echo "  make fpga / make package/sd_card.img"
 	@echo "      Build the Ultra96 host and kernel / package the board image."
@@ -110,7 +110,7 @@ $(LZW_BUILD)/lzw_test: $(LZW_DIR)/lzw_kernel.cpp $(LZW_DIR)/lzw_kernel_tb.cpp $(
 lzw-test: $(LZW_BUILD)/lzw_test $(LZW_BUILD)/lzw_seed23.bin
 	cd $(LZW_BUILD) && ./lzw_test
 
-lzw-cosim: $(LZW_BUILD)/lzw_seed23.bin
+lzw-cosim: lzw-test
 	LZW_SIM_DIR="$(abspath $(LZW_BUILD))" vitis_hls -f $(LZW_DIR)/lzw_sim.tcl
 
 fpga: $(SERVER_EXE) lzw.xclbin

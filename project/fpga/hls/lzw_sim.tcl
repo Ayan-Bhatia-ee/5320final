@@ -9,7 +9,7 @@ add_files -tb [file join $build_dir lzw_seed23.bin]
 open_solution -reset solution -flow_target vitis
 set_part xczu3eg-sbva484-1-i
 create_clock -period 10
-csim_design -clean
+# make lzw-cosim already ran this testbench against the C++ kernel.
 csynth_design
 cosim_design
 exit
