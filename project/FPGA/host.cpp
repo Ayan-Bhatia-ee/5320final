@@ -9,6 +9,7 @@
 // runs on the FPGA.
 // Kernel: lzw_kernel.cpp (lzw_kernel). Build: see Makefile / u96_v2.cfg.
 // Usage:  ./encoder [-b blocksize] [compressed output file] [xclbin]
+//         ./encoder --fpga-self-test [xclbin]
 //         (defaults: output_fpga.bin, encoder.xclbin)
 // Build with -DVERIFY_LZW to check every FPGA result against the software LZW encoder.
 
@@ -20,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <iostream>
 #include <vector>
 #include <unordered_map>
@@ -66,6 +68,8 @@ struct FpgaLzw {
 	cl::CommandQueue q;
 	cl::Kernel       krnl;
 	cl::Buffer       in_buf, out_buf;
+	uint8_t*         in_ptr  = NULL;
+	uint8_t*         out_ptr = NULL;
 	uint64_t         kernel_ns = 0;        // sum of kernel execution times (profiling info)
 	uint64_t         calls = 0;
 };
@@ -93,17 +97,32 @@ static void opencl_init(const char* xclbin_name) {
 	}
 	OCL_CHECK(err, Fpga->krnl = cl::Kernel(program, "lzw_kernel", &err));
 
-	OCL_CHECK(err, Fpga->in_buf  = cl::Buffer(context, CL_MEM_READ_ONLY,  (size_t) LZW_MAX_INPUT,  NULL, &err));
-	OCL_CHECK(err, Fpga->out_buf = cl::Buffer(context, CL_MEM_WRITE_ONLY, (size_t) LZW_MAX_OUTPUT, NULL, &err));
+	OCL_CHECK(err, Fpga->in_buf = cl::Buffer(
+			context, CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+			(size_t) LZW_MAX_INPUT, NULL, &err));
+	OCL_CHECK(err, Fpga->out_buf = cl::Buffer(
+			context, CL_MEM_ALLOC_HOST_PTR | CL_MEM_WRITE_ONLY,
+			(size_t) LZW_MAX_OUTPUT, NULL, &err));
 
-	// kernel arguments: 0 = input, 1 = final output, 2 = length (set per chunk).
+	// Bind before mapping so XRT can assign each BO to the kernel's memory group.
+	// Arguments: 0 = input, 1 = final output, 2 = length (set per chunk).
 	OCL_CHECK(err, err = Fpga->krnl.setArg(0, Fpga->in_buf));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->out_buf));
+
+	OCL_CHECK(err, Fpga->in_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(
+			Fpga->in_buf, CL_TRUE, CL_MAP_WRITE, 0, LZW_MAX_INPUT,
+			NULL, NULL, &err));
+	OCL_CHECK(err, Fpga->out_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(
+			Fpga->out_buf, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, LZW_MAX_OUTPUT,
+			NULL, NULL, &err));
 }
 
 static void opencl_shutdown() {
 	if (Fpga == NULL) return;
-	Fpga->q.finish();
+	cl_int err;
+	OCL_CHECK(err, err = Fpga->q.enqueueUnmapMemObject(Fpga->in_buf, Fpga->in_ptr));
+	OCL_CHECK(err, err = Fpga->q.enqueueUnmapMemObject(Fpga->out_buf, Fpga->out_ptr));
+	OCL_CHECK(err, err = Fpga->q.finish());
 	delete Fpga;
 	Fpga = NULL;
 }
@@ -174,11 +193,10 @@ static void dedup_insert(const Digest& d) { Seen[d] = Next_index++; }
 // ================================================================ LZW
 #define LZW_OUT_MAX     LZW_MAX_OUTPUT           // 32-bit header + packed codes = 13316 bytes
 
-// Software LZW, used only as the reference for -DVERIFY_LZW. Same algorithm and output
-// format as the kernel: 13-bit codes, MSB-first, dictionary reset per chunk.
+// Software LZW reference used by --fpga-self-test and, with -DVERIFY_LZW,
+// to validate every board result. Same format as the kernel.
 // Dictionary: open-addressed hash table keyed by (prefix_code << 8 | next_byte).
 // A generation counter "clears" it per chunk without touching the memory.
-#ifdef VERIFY_LZW
 #define LZW_MAX_CODES   (1 << CODE_LENGTH)      // codes 0..8191
 #define LZW_TABLE_BITS  14                      // 16384 slots, load <= 0.5
 #define LZW_TABLE_SIZE  (1 << LZW_TABLE_BITS)
@@ -244,8 +262,9 @@ static uint32_t lzw_encode(const uint8_t* in, uint32_t len, uint8_t* out) {
 	for (int i = 0; i < 4; i++) out[i] = (header >> (8 * i)) & 0xFF;
 	return w.pos;
 }
+#ifdef VERIFY_LZW
 static uint64_t Lzw_mismatches = 0;
-#endif // VERIFY_LZW
+#endif
 
 // Compress one unique chunk on the FPGA. Writes [32b header][packed codes] to out
 // (>= LZW_OUT_MAX bytes) and returns the total bytes written, like lzw_encode().
@@ -257,18 +276,27 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 	}
 
 	cl_int err;
-	cl::Event kev;
+	cl::Event input_done, kernel_done, output_done;
 	const uint32_t output_sentinel = 0xA5A55A5Au;
-	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(
-			Fpga->out_buf, CL_FALSE, 0, sizeof(output_sentinel), &output_sentinel));
+	memcpy(Fpga->in_ptr, in, len);
+	memset(Fpga->out_ptr, 0xA5, LZW_MAX_OUTPUT);
 	OCL_CHECK(err, err = Fpga->krnl.setArg(2, len));
-	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf, CL_FALSE, 0, len, in));
-	OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
 
-	// Match the tutorial transfer pattern: read the complete output BO after the kernel,
-	// rather than relying on a four-byte partial synchronization of an embedded XRT BO.
-	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
-			Fpga->out_buf, CL_TRUE, 0, LZW_MAX_OUTPUT, out));
+	// Course-reference lifecycle: migrate mapped BOs, explicitly wait for the
+	// transfer, launch, wait, then migrate the complete result back to the ARM.
+	OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects(
+			{Fpga->in_buf, Fpga->out_buf}, 0, NULL, &input_done));
+	OCL_CHECK(err, err = input_done.wait());
+	std::vector<cl::Event> kernel_wait(1, input_done);
+	OCL_CHECK(err, err = Fpga->q.enqueueTask(
+			Fpga->krnl, &kernel_wait, &kernel_done));
+	OCL_CHECK(err, err = kernel_done.wait());
+	std::vector<cl::Event> output_wait(1, kernel_done);
+	OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects(
+			{Fpga->out_buf}, CL_MIGRATE_MEM_OBJECT_HOST,
+			&output_wait, &output_done));
+	OCL_CHECK(err, err = output_done.wait());
+	memcpy(out, Fpga->out_ptr, LZW_MAX_OUTPUT);
 	uint32_t header = (uint32_t) out[0] |
 	                  ((uint32_t) out[1] << 8) |
 	                  ((uint32_t) out[2] << 16) |
@@ -276,8 +304,8 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 	uint32_t count = header >> 1;
 
 	cl_ulong t0 = 0, t1 = 0;
-	OCL_CHECK(err, err = kev.getProfilingInfo(CL_PROFILING_COMMAND_START, &t0));
-	OCL_CHECK(err, err = kev.getProfilingInfo(CL_PROFILING_COMMAND_END, &t1));
+	OCL_CHECK(err, err = kernel_done.getProfilingInfo(CL_PROFILING_COMMAND_START, &t0));
+	OCL_CHECK(err, err = kernel_done.getProfilingInfo(CL_PROFILING_COMMAND_END, &t1));
 	Fpga->kernel_ns += (t1 - t0);
 	Fpga->calls++;
 
@@ -297,15 +325,47 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 #ifdef VERIFY_LZW
 	static uint8_t ref[LZW_OUT_MAX + 16];
 	uint32_t n = lzw_encode(in, len, ref);
-	if ((n != 4 + count || memcmp(ref, out, n) != 0) && Lzw_mismatches++ < 10)
-		printf("LZW mismatch on unique chunk %llu (len %u): FPGA %u bytes, software %u bytes\n",
-		       (unsigned long long) Fpga->calls - 1, len, 4 + count, n);
+	if (n != 4 + count || memcmp(ref, out, n) != 0) {
+		Lzw_mismatches++;
+		fprintf(stderr,
+		        "FPGA LZW verification failed on call %llu (len %u): "
+		        "FPGA %u bytes, software %u bytes\n",
+		        (unsigned long long) Fpga->calls - 1, len, 4 + count, n);
+		opencl_shutdown();
+		exit(EXIT_FAILURE);
+	}
 #endif
 	return 4 + count;
 }
 
 // ================================================================ per-chunk path
 static uint8_t Lzw_buf[LZW_OUT_MAX + 16];
+
+static int fpga_self_test() {
+	static uint8_t input[2048];
+	static uint8_t expected[LZW_OUT_MAX + 16];
+	static uint8_t actual[LZW_OUT_MAX + 16];
+	uint32_t state = 0x5320C0DEu;
+	for (size_t i = 0; i < sizeof(input); ++i) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		input[i] = (uint8_t) state;
+	}
+
+	uint32_t expected_bytes = lzw_encode(input, sizeof(input), expected);
+	uint32_t actual_bytes = lzw_encode_fpga(input, sizeof(input), actual);
+	if (actual_bytes != expected_bytes ||
+	    memcmp(actual, expected, expected_bytes) != 0) {
+		fprintf(stderr,
+		        "FPGA self-test FAILED: hardware returned %u bytes, expected %u bytes\n",
+		        actual_bytes, expected_bytes);
+		return EXIT_FAILURE;
+	}
+	printf("FPGA self-test PASSED: 2048 input bytes -> %u output bytes\n",
+	       actual_bytes);
+	return EXIT_SUCCESS;
+}
 
 static void process_chunk(const uint8_t* d, uint32_t len) {
 	Total_chunks++;
@@ -377,31 +437,66 @@ static void cdc_flush() {
 }
 
 // ================================================================ main / input
-void handle_input(int argc, char* argv[], int* blocksize, const char** outname, const char** xclbin) {
+static void print_usage(const char* program) {
+	fprintf(stderr,
+	        "Usage: %s [-b blocksize] [output file] [xclbin]\n"
+	        "       %s --fpga-self-test [xclbin]\n",
+	        program, program);
+}
+
+void handle_input(int argc, char* argv[], int* blocksize, const char** outname,
+		const char** xclbin, bool* self_test) {
 	int x;
 	extern char *optarg;
 	extern int optind;
+	static const struct option long_options[] = {
+		{"fpga-self-test", no_argument, NULL, 't'},
+		{"help",           no_argument, NULL, 'h'},
+		{NULL, 0, NULL, 0}
+	};
 
-	while ((x = getopt(argc, argv, ":b:")) != -1) {
+	while ((x = getopt_long(argc, argv, ":b:th", long_options, NULL)) != -1) {
 		switch (x) {
 		case 'b':
 			*blocksize = atoi(optarg);
 			printf("blocksize is set to %d optarg\n", *blocksize);
 			break;
-		case ':':
-			printf("-%c without parameter\n", optopt);
+		case 't':
+			*self_test = true;
 			break;
+		case 'h':
+			print_usage(argv[0]);
+			exit(EXIT_SUCCESS);
+		case ':':
+			fprintf(stderr, "-%c without parameter\n", optopt);
+			print_usage(argv[0]);
+			exit(EXIT_FAILURE);
+		default:
+			print_usage(argv[0]);
+			exit(EXIT_FAILURE);
 		}
 	}
-	if (optind < argc) *outname = argv[optind];   // one argument: compressed output file
-	if (optind + 1 < argc) *xclbin = argv[optind + 1];   // optional: xclbin path
+	if (*self_test) {
+		if (optind < argc) *xclbin = argv[optind];
+		if (optind + 1 < argc) {
+			print_usage(argv[0]);
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		if (optind < argc) *outname = argv[optind];
+		if (optind + 1 < argc) *xclbin = argv[optind + 1];
+		if (optind + 2 < argc) {
+			print_usage(argv[0]);
+			exit(EXIT_FAILURE);
+		}
+	}
 }
 
 int main(int argc, char* argv[]) {
 	stopwatch ethernet_timer;
 	stopwatch total_timer;
 	stopwatch opencl_timer;
-	unsigned char* input[NUM_PACKETS];
+	unsigned char* input[NUM_PACKETS] = {};
 	int writer = 0;
 	int done = 0;
 	int length = 0;
@@ -411,20 +506,28 @@ int main(int argc, char* argv[]) {
 	int blocksize = BLOCKSIZE;
 	const char* outname = "output_fpga.bin";
 	const char* xclbin = "encoder.xclbin";       // expected next to the executable
-	handle_input(argc, argv, &blocksize, &outname, &xclbin);
-
-	for (int i = 0; i < NUM_PACKETS; i++) {
-		input[i] = (unsigned char*) malloc(sizeof(unsigned char) * (NUM_ELEMENTS + HEADER));
-		if (input[i] == NULL) {
-			std::cout << "aborting " << std::endl;
-			return 1;
-		}
-	}
+	bool self_test = false;
+	handle_input(argc, argv, &blocksize, &outname, &xclbin, &self_test);
 
 	Fpga = new FpgaLzw();
 	opencl_timer.start();
 	opencl_init(xclbin);                      // program FPGA, create buffers (not part of the timed run)
 	opencl_timer.stop();
+	if (self_test) {
+		int result = fpga_self_test();
+		opencl_shutdown();
+		return result;
+	}
+
+	for (int i = 0; i < NUM_PACKETS; i++) {
+		input[i] = (unsigned char*) malloc(sizeof(unsigned char) * (NUM_ELEMENTS + HEADER));
+		if (input[i] == NULL) {
+			std::cout << "aborting " << std::endl;
+			for (int j = 0; j < i; ++j) free(input[j]);
+			opencl_shutdown();
+			return 1;
+		}
+	}
 
 	Output.reserve((size_t) 1 << 28);   // 256 MiB up front: avoids a mid-run realloc/copy stall
 	cdc_init();
@@ -438,6 +541,8 @@ int main(int argc, char* argv[]) {
 	for (;;) {
 		if (packet_bytes < HEADER) {
 			fprintf(stderr, "received invalid UDP packet length %d\n", packet_bytes);
+			opencl_shutdown();
+			for (int i = 0; i < NUM_PACKETS; ++i) free(input[i]);
 			return EXIT_FAILURE;
 		}
 
@@ -448,6 +553,8 @@ int main(int argc, char* argv[]) {
 		if ((uint32_t) length != (uint32_t) (packet_bytes - HEADER)) {
 			fprintf(stderr, "UDP length mismatch: header says %d bytes, received %d\n",
 			        length, packet_bytes - HEADER);
+			opencl_shutdown();
+			for (int i = 0; i < NUM_PACKETS; ++i) free(input[i]);
 			return EXIT_FAILURE;
 		}
 
@@ -473,7 +580,12 @@ int main(int argc, char* argv[]) {
 	total_timer.stop();
 
 	FILE *outfd = fopen(outname, "wb");
-	if (outfd == NULL) { printf("cannot open %s\n", outname); return 1; }
+	if (outfd == NULL) {
+		printf("cannot open %s\n", outname);
+		opencl_shutdown();
+		for (int i = 0; i < NUM_PACKETS; ++i) free(input[i]);
+		return 1;
+	}
 	size_t bytes_written = fwrite(Output.data(), 1, Output.size(), outfd);
 	int close_err = fclose(outfd);
 	if (bytes_written != Output.size() || close_err != 0)

@@ -11,6 +11,13 @@ VITIS_PLATFORM_PATH = $(VITIS_PLATFORM_DIR)/u96v2_sbc_base.xpfm
 CXXFLAGS += -march=armv8-a+simd -mtune=cortex-a53 -std=c++11 -DVITIS_PLATFORM=$(VITIS_PLATFORM) -D__USE_XOPEN2K8 -I$(XILINX_VIVADO)/include/ -I$(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain/sysroot/cortexa72-cortexa53-xilinx-linux/usr/include/xrt/ -O3 -g -Wall -c -fmessage-length=0 --sysroot=$(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain/sysroot/cortexa72-cortexa53-xilinx-linux
 LDFLAGS += -lxilinxopencl -lpthread -lrt -ldl -lcrypt -lstdc++ -L$(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain/sysroot/cortexa72-cortexa53-xilinx-linux/usr/lib/ --sysroot=$(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain/sysroot/cortexa72-cortexa53-xilinx-linux
 
+# Board bring-up defaults to checking every FPGA result against the ARM reference.
+# Use `make clean && make VERIFY_LZW=0 ...` only for final performance measurements.
+VERIFY_LZW ?= 1
+ifeq ($(VERIFY_LZW),1)
+CXXFLAGS += -DVERIFY_LZW
+endif
+
 # hardware compiler shared settings
 VPP_OPTS = --target hw
 
@@ -28,10 +35,19 @@ HOST_SOURCES = ./host.cpp ./xcl2.cpp ./server.cpp
 HOST_OBJECTS =$(HOST_SOURCES:.cpp=.o)
 HOST_EXE = encoder
 
+# Runtime tracing is opt-in because it is not needed for correct execution and
+# can add substantial pressure on an embedded target. Enable with XRT_INI=xrt.ini.
+XRT_INI ?=
 
-.PHONY: all clean lzw-test lzw-cosim
+
+.PHONY: all fpga xclbin-info clean lzw-test lzw-cosim
 
 all: package/sd_card.img
+
+fpga: $(HOST_EXE) $(XCLBIN)
+
+xclbin-info: $(XCLBIN)
+	xclbinutil --info --input $(XCLBIN)
 
 .cpp.o:
 	$(HOST_CXX) $(CXXFLAGS) -I. -o "$@" "$<"
@@ -47,7 +63,7 @@ $(XO): ./lzw_kernel.cpp lzw_kernel.h u96_v2.cfg
 $(XCLBIN): $(XO) u96_v2.cfg
 	$(VPP) $(VPP_OPTS) --link --config ./u96_v2.cfg -o"$@" $(XO)
 
-package/sd_card.img: $(HOST_EXE) $(XCLBIN) xrt.ini
+package/sd_card.img: $(HOST_EXE) $(XCLBIN) $(XRT_INI)
 	$(VPP) --package $(VPP_OPTS) --platform $(VITIS_PLATFORM) $(XCLBIN) \
 	       --package.out_dir package \
 	       --package.sd_file $(HOST_EXE)\
@@ -55,7 +71,7 @@ package/sd_card.img: $(HOST_EXE) $(XCLBIN) xrt.ini
 	       --package.dtb $(PLATFORM_REPO_PATHS)/sw/u96v2_sbc_base/linux_domain/image/system.dtb \
 	       --package.rootfs ${PLATFORM_REPO_PATHS}/sw/u96v2_sbc_base/linux_domain/rootfs/rootfs.ext4 \
 	       --package.sd_file $(XCLBIN) \
-	       --package.sd_file xrt.ini
+	       $(addprefix --package.sd_file ,$(XRT_INI))
 
 #
 # LZW kernel tests (moved from the top-level Makefile)

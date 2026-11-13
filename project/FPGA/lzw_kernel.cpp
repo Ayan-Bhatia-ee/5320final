@@ -20,9 +20,6 @@ extern "C" void lzw_kernel(const uint8_t* input, uint8_t* output,
 #pragma HLS INTERFACE s_axilite port=output        bundle=control
 #pragma HLS INTERFACE s_axilite port=length        bundle=control
 #pragma HLS INTERFACE s_axilite port=return        bundle=control
-// Match fpga_example/MMult (the design that worked on this board): plain start/done
-// handshake instead of the Vitis default ap_ctrl_chain, which both failing kernels used.
-#pragma HLS INTERFACE ap_ctrl_hs port=return
 
     if (length == 0 || length > LZW_MAX_INPUT) {
         output[0] = output[1] = output[2] = output[3] = 0;
