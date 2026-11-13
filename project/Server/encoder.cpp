@@ -14,6 +14,14 @@
 // handout, adapted to the provided decoder (13-bit fixed codes, no end code).
 
 #include "encoder.h"
+#include "../fpga/hls/lzw_kernel.h"
+
+#define CL_TARGET_OPENCL_VERSION 120
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
+#include <CL/cl.h>
+#endif
 
 #include <stdio.h>
 #include <stdint.h>
@@ -21,6 +29,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <iostream>
+#include <fstream>
+#include <iterator>
 #include <vector>
 #include <unordered_map>
 #include "server.h"
@@ -34,8 +44,8 @@
 #define DONE_BIT_L (1 << 7)
 #define DONE_BIT_H (1 << 15)
 
-#define CODE_LENGTH 13                  // ceil(log2(MAX_CHUNK)); must match decoder
-#define MAX_CHUNK   8192
+#define CODE_LENGTH LZW_CODE_BITS       // must match decoder
+#define MAX_CHUNK   LZW_MAX_INPUT
 #define MIN_CHUNK   2048
 #define CDC_WINDOW  16
 #define CDC_MASK    0x7FF               // ~2 KiB expected past MIN_CHUNK => ~4 KiB average
@@ -145,7 +155,7 @@ static void dedup_insert(const Digest& d) { Seen[d] = Next_index++; }
 #define LZW_MAX_CODES   (1 << CODE_LENGTH)      // codes 0..8191
 #define LZW_TABLE_BITS  14                      // 16384 slots, load <= 0.5
 #define LZW_TABLE_SIZE  (1 << LZW_TABLE_BITS)
-#define LZW_OUT_MAX     (4 + (CODE_LENGTH * MAX_CHUNK + 7) / 8)   // 13316 bytes
+#define LZW_OUT_MAX     (4 + LZW_MAX_PAYLOAD)
 
 struct LzwSlot { uint32_t gen; uint32_t key; uint16_t code; };
 static LzwSlot  Lzw_table[LZW_TABLE_SIZE];      // gen 0 = never used
@@ -212,6 +222,115 @@ static uint32_t lzw_encode(const uint8_t* in, uint32_t len, uint8_t* out) {
 // ================================================================ per-chunk path
 static uint8_t Lzw_buf[LZW_OUT_MAX + 16];
 
+// OpenCL handles are created only when -x is supplied and reused for every
+// unique chunk. The in-order queue makes each blocking read wait for its task.
+struct FpgaLzw {
+	cl_context context = nullptr;
+	cl_command_queue queue = nullptr;
+	cl_program program = nullptr;
+	cl_kernel kernel = nullptr;
+	cl_mem input = nullptr, payload = nullptr, size = nullptr;
+	cl_ulong kernel_ns = 0;
+
+	~FpgaLzw() {
+		if (size) clReleaseMemObject(size);
+		if (payload) clReleaseMemObject(payload);
+		if (input) clReleaseMemObject(input);
+		if (kernel) clReleaseKernel(kernel);
+		if (program) clReleaseProgram(program);
+		if (queue) clReleaseCommandQueue(queue);
+		if (context) clReleaseContext(context);
+	}
+};
+static FpgaLzw Fpga;
+
+static void check_cl(cl_int status, const char* operation) {
+	if (status != CL_SUCCESS) {
+		fprintf(stderr, "FPGA LZW: %s failed (OpenCL %d)\n", operation, status);
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void init_lzw_fpga(const char* path) {
+	std::ifstream file(path, std::ios::binary);
+	bytes image{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+	if (image.empty() || file.bad()) {
+		fprintf(stderr, "FPGA LZW: cannot read xclbin '%s'\n", path);
+		exit(EXIT_FAILURE);
+	}
+
+	cl_uint count = 0;
+	check_cl(clGetPlatformIDs(0, nullptr, &count), "count platforms");
+	std::vector<cl_platform_id> platforms(count);
+	if (count) check_cl(clGetPlatformIDs(count, platforms.data(), nullptr), "list platforms");
+	cl_device_id device = nullptr;
+	for (cl_platform_id platform : platforms) {
+		cl_int status = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ACCELERATOR, 1, &device, nullptr);
+		if (status == CL_DEVICE_NOT_FOUND) continue;
+		check_cl(status, "select accelerator");
+		break;
+	}
+	if (!device) {
+		fprintf(stderr, "FPGA LZW: no OpenCL accelerator found\n");
+		exit(EXIT_FAILURE);
+	}
+
+	cl_int status, binary_status;
+	Fpga.context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &status);
+	check_cl(status, "create context");
+	const unsigned char* binary = image.data();
+	size_t binary_size = image.size();
+	Fpga.program = clCreateProgramWithBinary(Fpga.context, 1, &device, &binary_size,
+	                                         &binary, &binary_status, &status);
+	check_cl(status, "load xclbin");
+	check_cl(binary_status, "validate xclbin");
+	check_cl(clBuildProgram(Fpga.program, 1, &device, nullptr, nullptr, nullptr), "build program");
+	Fpga.kernel = clCreateKernel(Fpga.program, "lzw_kernel", &status);
+	check_cl(status, "open lzw_kernel");
+	Fpga.queue = clCreateCommandQueue(Fpga.context, device, CL_QUEUE_PROFILING_ENABLE, &status);
+	check_cl(status, "create queue");
+	Fpga.input = clCreateBuffer(Fpga.context, CL_MEM_READ_ONLY, MAX_CHUNK, nullptr, &status);
+	check_cl(status, "allocate input");
+	Fpga.payload = clCreateBuffer(Fpga.context, CL_MEM_WRITE_ONLY, LZW_MAX_PAYLOAD, nullptr, &status);
+	check_cl(status, "allocate payload");
+	Fpga.size = clCreateBuffer(Fpga.context, CL_MEM_WRITE_ONLY, sizeof(uint32_t), nullptr, &status);
+	check_cl(status, "allocate payload count");
+	check_cl(clSetKernelArg(Fpga.kernel, 0, sizeof(cl_mem), &Fpga.input), "bind input");
+	check_cl(clSetKernelArg(Fpga.kernel, 1, sizeof(cl_mem), &Fpga.payload), "bind payload");
+	check_cl(clSetKernelArg(Fpga.kernel, 2, sizeof(cl_mem), &Fpga.size), "bind payload count");
+}
+
+static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
+	if (len == 0) return 0;
+	if (len > MAX_CHUNK) {
+		fprintf(stderr, "FPGA LZW: input size %u exceeds %u\n", len, (unsigned)MAX_CHUNK);
+		exit(EXIT_FAILURE);
+	}
+	check_cl(clSetKernelArg(Fpga.kernel, 3, sizeof(len), &len), "set input length");
+	check_cl(clEnqueueWriteBuffer(Fpga.queue, Fpga.input, CL_TRUE, 0, len, in,
+	                              0, nullptr, nullptr), "write chunk");
+	cl_event event;
+	check_cl(clEnqueueTask(Fpga.queue, Fpga.kernel, 0, nullptr, &event), "launch lzw_kernel");
+	uint32_t count = 0;
+	check_cl(clEnqueueReadBuffer(Fpga.queue, Fpga.size, CL_TRUE, 0, sizeof(count), &count,
+	                             0, nullptr, nullptr), "read payload count");
+	if (count < 2 || count > (CODE_LENGTH * len + 7) / 8) {
+		fprintf(stderr, "FPGA LZW: invalid payload size %u for %u input bytes\n", count, len);
+		exit(EXIT_FAILURE);
+	}
+	check_cl(clEnqueueReadBuffer(Fpga.queue, Fpga.payload, CL_TRUE, 0, count, out + 4,
+	                             0, nullptr, nullptr), "read payload");
+	cl_ulong start, end;
+	check_cl(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr), "kernel start time");
+	check_cl(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr), "kernel end time");
+	clReleaseEvent(event);
+	Fpga.kernel_ns += end - start;
+
+	uint32_t header = count << 1;
+	for (int i = 0; i < 4; ++i) out[i] = (header >> (8 * i)) & 0xFF;
+	return 4 + count;
+}
+
 static void process_chunk(const uint8_t* d, uint32_t len) {
 	Total_chunks++;
 
@@ -234,7 +353,7 @@ static void process_chunk(const uint8_t* d, uint32_t len) {
 		Dedup_timer.stop();
 
 		Lzw_timer.start();
-		uint32_t n = lzw_encode(d, len, Lzw_buf);
+		uint32_t n = Fpga.kernel ? lzw_encode_fpga(d, len, Lzw_buf) : lzw_encode(d, len, Lzw_buf);
 		Lzw_timer.stop();
 
 		Output.insert(Output.end(), Lzw_buf, Lzw_buf + n);
@@ -282,20 +401,23 @@ static void cdc_flush() {
 }
 
 // ================================================================ main / input
-void handle_input(int argc, char* argv[], int* blocksize, const char** outname) {
+void handle_input(int argc, char* argv[], int* blocksize, const char** outname, const char** xclbin) {
 	int x;
 	extern char *optarg;
 	extern int optind;
 
-	while ((x = getopt(argc, argv, ":b:")) != -1) {
+	while ((x = getopt(argc, argv, ":b:x:")) != -1) {
 		switch (x) {
 		case 'b':
 			*blocksize = atoi(optarg);
 			printf("blocksize is set to %d optarg\n", *blocksize);
 			break;
-		case ':':
-			printf("-%c without parameter\n", optopt);
+		case 'x':
+			*xclbin = optarg;
 			break;
+		default:
+			fprintf(stderr, "Usage: %s [-b blocksize] [-x lzw.xclbin] [output_file]\n", argv[0]);
+			exit(EXIT_FAILURE);
 		}
 	}
 	if (optind < argc) *outname = argv[optind];   // one argument: compressed output file
@@ -313,7 +435,9 @@ int main(int argc, char* argv[]) {
 
 	int blocksize = BLOCKSIZE;
 	const char* outname = "output_cpu.bin";
-	handle_input(argc, argv, &blocksize, &outname);
+	const char* xclbin = nullptr;
+	handle_input(argc, argv, &blocksize, &outname, &xclbin);
+	if (xclbin) init_lzw_fpga(xclbin);
 
 	for (int i = 0; i < NUM_PACKETS; i++) {
 		input[i] = (unsigned char*) malloc(sizeof(unsigned char) * (NUM_ELEMENTS + HEADER));
@@ -377,6 +501,12 @@ int main(int argc, char* argv[]) {
 	printf("--------------- Time breakdown (ms) ---------------\n");
 	printf("CDC %.2f | SHA-256 %.2f | dedup %.2f | LZW %.2f | total compute %.2f\n",
 	       cdc_ms, sha_ms, dedup_ms, lzw_ms, compute_ms);
+	if (Fpga.kernel) {
+		uint64_t calls = Total_chunks - Dup_chunks;
+		printf("FPGA LZW: %llu calls | host %.3f ms | kernel %.3f ms | %.2f Mb/s unique input\n",
+		       (unsigned long long)calls, lzw_ms, Fpga.kernel_ns / 1.0e6,
+		       lzw_ms > 0 ? Uniq_bytes * 0.008 / lzw_ms : 0.0);
+	}
 
 	std::cout << "--------------- Key Throughputs ---------------" << std::endl;
 	float ethernet_latency = ethernet_timer.latency() / 1000.0;

@@ -1,0 +1,14 @@
+# Run from the project directory with make lzw-cosim.
+set build_dir $::env(LZW_SIM_DIR)
+open_project -reset [file join $build_dir hls]
+set_top lzw_kernel
+add_files fpga/hls/lzw_kernel.cpp
+add_files -tb fpga/hls/lzw_kernel_tb.cpp -cflags "-std=c++11"
+add_files -tb [file join $build_dir lzw_seed23.bin]
+open_solution -reset solution -flow_target vitis
+set_part xczu3eg-sbva484-1-i
+create_clock -period 10
+csim_design
+csynth_design
+cosim_design
+exit

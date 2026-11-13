@@ -1,5 +1,5 @@
 #######################################################################################
-.PHONY: help
+.PHONY: help fpga lzw-test lzw-cosim clean
 help:
 	@echo "Makefile Usage:"
 	@echo ""
@@ -14,6 +14,13 @@ help:
 	@echo ""
 	@echo "  make encoder "
 	@echo "      Command to build encoder."
+	@echo "      Run ./encoder -x lzw.xclbin [output_file] for FPGA LZW."
+	@echo ""
+	@echo "  make lzw-test / make lzw-cosim"
+	@echo "      Run the native kernel tests / Vitis HLS simulation and co-simulation."
+	@echo ""
+	@echo "  make fpga / make package/sd_card.img"
+	@echo "      Build the Ultra96 host and kernel / package the board image."
 	@echo ""
 	@echo "  make decoder "
 	@echo "      Command to build decoder."
@@ -39,14 +46,14 @@ CXXFLAGS += -march=armv8-a+simd -mtune=cortex-a53 -std=c++11 -DVITIS_PLATFORM=$(
 LDFLAGS += -lxilinxopencl -lpthread -lrt -ldl -lcrypt -lstdc++ -L$(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain/sysroot/cortexa72-cortexa53-xilinx-linux/usr/lib/ --sysroot=$(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain/sysroot/cortexa72-cortexa53-xilinx-linux
 
 # hardware compiler shared settings
-VPP_OPTS = --target hw
+VPP_OPTS = --target hw --platform $(VITIS_PLATFORM_PATH)
 
 #
-# OpenCL kernel files (example)
+# LZW hardware and simulation
 #
-# XO := kernel.xo
-# XCLBIN := kernel.xclbin
-# ALL_MESSAGE_FILES = $(subst .xo,.mdb,$(XO)) $(subst .xclbin,.mdb,$(XCLBIN))
+LZW_DIR = fpga/hls
+LZW_BUILD = build/lzw
+PLATFORM_LINUX = $(VITIS_PLATFORM_DIR)/sw/$(VITIS_PLATFORM)/linux_domain
 
 #
 # host files
@@ -72,6 +79,8 @@ $(CLIENT_EXE) $(CLIENT_EXE_MAC): $(CLIENT_SOURCES)
 $(SERVER_EXE): $(SERVER_OBJECTS)
 	$(HOST_CXX) -o "$@" $(+) $(LDFLAGS)
 
+Server/encoder.o: $(LZW_DIR)/lzw_kernel.h
+
 $(DECODER_EXE): $(DECODER_OBJECTS)
 	$(HOST_CXX) -o "$@" $(+) $(LDFLAGS)
 
@@ -84,36 +93,38 @@ $(DECODER_EXE): $(DECODER_OBJECTS)
 
 .NOTPARALLEL: clean
 
-# clean-accelerators:
-# 	-$(RM) $(XCLBIN) $(XO) $(ALL_MESSAGE_FILES)
-# 	-$(RM) *.xclbin.sh *.xclbin.info *.xclbin.link_summary* *.compile_summary
-# 	-$(RMDIR) .Xil
-
-# clean-package:
-# 	-${RMDIR} package
-# 	-${RMDIR} package.build
-
-clean: # clean-accelerators clean-package
+clean:
 	-$(RM) $(SERVER_EXE) $(SERVER_OBJECTS) $(DECODER_EXE) $(DECODER_OBJECTS) $(CLIENT_EXE) $(CLIENT_EXE_MAC)
-# 	-$(RM) *.log *.package_summary
-# 	-${RMDIR} _x .ipcache
+	-$(RM) lzw.xclbin
+	-$(RMDIR) $(LZW_BUILD)
 
-#
-# binary container: kernel.xclbin (example)
-#
+$(LZW_BUILD):
+	mkdir -p $@
 
-# $(XO): fpga/hls/MMult.cpp
-# 	-@$(RM) $@
-# 	$(VPP) $(VPP_OPTS) -k mmult_fpga --compile -I"$(<D)" --config fpga/design.cfg -o"$@" "$<"
-# $(XCLBIN): $(XO)
-# 	$(VPP) $(VPP_OPTS) --link --config fpga/design.cfg -o"$@" $(+)
+$(LZW_BUILD)/lzw_seed23.bin: | $(LZW_BUILD)
+	python3 -c 'import random; from pathlib import Path; r = random.Random(23); Path("$@").write_bytes(bytes(r.getrandbits(8) for _ in range(8192)))'
 
-# package/sd_card.img: $(SERVER_EXE) $(XCLBIN) xrt.ini
-# 	$(VPP) --package $(VPP_OPTS) --config ./u96_v2.cfg $(XCLBIN) \
-# 	       --package.out_dir package \
-# 	       --package.sd_file $(SERVER_EXE)\
-# 	       --package.kernel_image $(PLATFORM_REPO_PATHS)/sw/u96v2_sbc_base/linux_domain/image/Image \
-# 	       --package.dtb $(PLATFORM_REPO_PATHS)/sw/u96v2_sbc_base/linux_domain/image/system.dtb \
-# 	       --package.rootfs ${PLATFORM_REPO_PATHS}/sw/u96v2_sbc_base/linux_domain/rootfs/rootfs.ext4 \
-# 	       --package.sd_file $(XCLBIN) \
-# 	       --package.sd_file xrt.ini
+$(LZW_BUILD)/lzw_test: $(LZW_DIR)/lzw_kernel.cpp $(LZW_DIR)/lzw_kernel_tb.cpp $(LZW_DIR)/lzw_kernel.h | $(LZW_BUILD)
+	$(CXX) -std=c++11 -O2 $(filter %.cpp,$^) -o $@
+
+lzw-test: $(LZW_BUILD)/lzw_test $(LZW_BUILD)/lzw_seed23.bin
+	cd $(LZW_BUILD) && ./lzw_test
+
+lzw-cosim: $(LZW_BUILD)/lzw_seed23.bin
+	LZW_SIM_DIR="$(abspath $(LZW_BUILD))" vitis_hls -f $(LZW_DIR)/lzw_sim.tcl
+
+fpga: $(SERVER_EXE) lzw.xclbin
+
+$(LZW_BUILD)/lzw_kernel.xo: $(LZW_DIR)/lzw_kernel.cpp $(LZW_DIR)/lzw_kernel.h | $(LZW_BUILD)
+	$(VPP) $(VPP_OPTS) -c -k lzw_kernel -o $@ $<
+
+lzw.xclbin: $(LZW_BUILD)/lzw_kernel.xo
+	$(VPP) $(VPP_OPTS) -l -o $@ $<
+
+package/sd_card.img: $(SERVER_EXE) $(DECODER_EXE) lzw.xclbin
+	$(VPP) $(VPP_OPTS) --package lzw.xclbin --package.out_dir package \
+		--package.kernel_image $(PLATFORM_LINUX)/image/Image \
+		--package.dtb $(PLATFORM_LINUX)/image/system.dtb \
+		--package.rootfs $(PLATFORM_LINUX)/rootfs/rootfs.ext4 \
+		--package.sd_file $(SERVER_EXE) --package.sd_file $(DECODER_EXE) \
+		--package.sd_file lzw.xclbin
