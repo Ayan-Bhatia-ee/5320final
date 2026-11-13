@@ -15,7 +15,7 @@
 // basic
 int ESE532_Server::setup_server(int avg_blocksize) {
 
-	printf("setting up sever...\n");
+	printf("setting up server...\n");
 
 	//
 	int opt = 1;

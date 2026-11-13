@@ -258,19 +258,21 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 
 	cl_int err;
 	cl::Event kev;
+	const uint32_t output_sentinel = 0xA5A55A5Au;
+	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(
+			Fpga->out_buf, CL_FALSE, 0, sizeof(output_sentinel), &output_sentinel));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(2, len));
 	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf, CL_FALSE, 0, len, in));
 	OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
 
-	// Reading the four-byte header with CL_TRUE waits for the preceding kernel in this
-	// in-order queue. The remaining read then transfers only the valid payload bytes.
-	uint8_t header_bytes[4];
+	// Match the tutorial transfer pattern: read the complete output BO after the kernel,
+	// rather than relying on a four-byte partial synchronization of an embedded XRT BO.
 	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
-			Fpga->out_buf, CL_TRUE, 0, sizeof(header_bytes), header_bytes));
-	uint32_t header = (uint32_t) header_bytes[0] |
-	                  ((uint32_t) header_bytes[1] << 8) |
-	                  ((uint32_t) header_bytes[2] << 16) |
-	                  ((uint32_t) header_bytes[3] << 24);
+			Fpga->out_buf, CL_TRUE, 0, LZW_MAX_OUTPUT, out));
+	uint32_t header = (uint32_t) out[0] |
+	                  ((uint32_t) out[1] << 8) |
+	                  ((uint32_t) out[2] << 16) |
+	                  ((uint32_t) out[3] << 24);
 	uint32_t count = header >> 1;
 
 	cl_ulong t0 = 0, t1 = 0;
@@ -283,17 +285,15 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 	if ((header & 1) != 0 || count < 2 || count > (CODE_LENGTH * len + 7) / 8) {
 		fprintf(stderr,
 		        "FPGA LZW returned invalid header 0x%08x (%u payload bytes) "
-		        "for %u input bytes; kernel event %.1f us\n",
-		        header, count, len, (t1 - t0) / 1e3);
+		        "for %u input bytes; kernel event %.1f us%s\n",
+		        header, count, len, (t1 - t0) / 1e3,
+		        header == output_sentinel ? "; output was not written" :
+		        header == 0 ? "; kernel wrote its invalid-length header" : "");
 		// Release the XRT buffers explicitly instead of making zocl tear them down from
 		// process-exit cleanup.  The board log shows that cleanup path corrupting mm state.
 		opencl_shutdown();
 		exit(EXIT_FAILURE);
 	}
-	memcpy(out, header_bytes, sizeof(header_bytes));
-	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
-			Fpga->out_buf, CL_TRUE, 4, count, out + 4));
-
 #ifdef VERIFY_LZW
 	static uint8_t ref[LZW_OUT_MAX + 16];
 	uint32_t n = lzw_encode(in, len, ref);
