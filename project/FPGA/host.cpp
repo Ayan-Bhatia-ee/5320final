@@ -4,9 +4,12 @@
 //                                                 -+-> duplicate header
 //                                                  +-> LZW (ARM) -> output buffer -> file
 //
-// Baseline version: one kernel call per chunk (copy in, run, copy out, wait).
-// Kernel: sha_kernel.cpp (sha256_kernel). Build: see Makefile / u96_v2.cfg.
-// Usage:  ./encoder [-b blocksize] <compressed output file> [xclbin]   (xclbin defaults to encoder.xclbin)
+// One kernel call per chunk (copy in, run, copy out, wait).
+// Buffers are mapped once at setup; each call only migrates them (Vitis tutorial pattern).
+// Kernel: hls/sha_kernel.cpp (sha256_kernel). Build: see Makefile / u96_v2.cfg.
+// Usage:  ./encoder [-b blocksize] [compressed output file] [xclbin]
+//         (defaults: output_fpga.bin, encoder.xclbin)
+// Build with -DVERIFY_SHA to check every FPGA digest against software SHA-256.
 
 #include "encoder.h"
 #include "xcl2.hpp"          // OpenCL utility layer (includes CL/cl2.hpp)
@@ -33,7 +36,7 @@
 #define DONE_BIT_H (1 << 15)
 
 #define CODE_LENGTH 13                  // ceil(log2(MAX_CHUNK)); must match decoder
-#define MAX_CHUNK   8192
+#define MAX_CHUNK   MAX_CHUNK_SIZE      // CDC chunks must fit the kernel's input buffer
 #define MIN_CHUNK   2048
 #define CDC_WINDOW  16
 #define CDC_MASK    0x7FF               // ~2 KiB expected past MIN_CHUNK => ~4 KiB average
@@ -70,6 +73,10 @@ static FpgaSha* Fpga = NULL;
 static void opencl_init(const char* xclbin_name) {
 	cl_int err;
 	auto devices = xcl::get_xil_devices();
+	if (devices.empty()) {
+		printf("No Xilinx device found\n");
+		exit(EXIT_FAILURE);
+	}
 	auto fileBuf = xcl::read_binary_file(xclbin_name);
 	cl::Program::Binaries bins{{fileBuf.data(), fileBuf.size()}};
 	cl::Device device = devices[0];
@@ -85,10 +92,15 @@ static void opencl_init(const char* xclbin_name) {
 
 	OCL_CHECK(err, Fpga->in_buf  = cl::Buffer(context, CL_MEM_READ_ONLY,  MAX_CHUNK_SIZE,     NULL, &err));
 	OCL_CHECK(err, Fpga->out_buf = cl::Buffer(context, CL_MEM_WRITE_ONLY, SHA256_DIGEST_SIZE, NULL, &err));
-	Fpga->in_ptr  = (uint8_t*) Fpga->q.enqueueMapBuffer(Fpga->in_buf,  CL_TRUE, CL_MAP_WRITE, 0, MAX_CHUNK_SIZE);
-	Fpga->out_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(Fpga->out_buf, CL_TRUE, CL_MAP_READ,  0, SHA256_DIGEST_SIZE);
+	// Map once for the whole run. Each call then only migrates the buffers, which does the
+	// host<->FPGA sync; no per-chunk unmap/re-map is needed.
+	OCL_CHECK(err, Fpga->in_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(
+			Fpga->in_buf, CL_TRUE, CL_MAP_WRITE, 0, MAX_CHUNK_SIZE, NULL, NULL, &err));
+	OCL_CHECK(err, Fpga->out_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(
+			Fpga->out_buf, CL_TRUE, CL_MAP_READ, 0, SHA256_DIGEST_SIZE, NULL, NULL, &err));
 
-	// kernel arguments: 0 = input_data, 1 = output_digest, 2 = length (set per chunk)
+	// kernel arguments: 0 = input_data, 1 = output_digest, 2 = length (set per chunk).
+	// The same cl::Buffer objects are used for setArg, mapping and migration.
 	OCL_CHECK(err, err = Fpga->krnl.setArg(0, Fpga->in_buf));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->out_buf));
 }
@@ -102,8 +114,62 @@ static void opencl_shutdown() {
 	Fpga = NULL;
 }
 
+// ================================================================ software SHA-256 (verification only)
+#ifdef VERIFY_SHA
+static const uint32_t K256_sw[64] = {
+	0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+	0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+	0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+	0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+	0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+	0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+	0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+	0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+#define ROR32_SW(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+static void sha256_sw_block(uint32_t h[8], const uint8_t* p) {
+	uint32_t w[64];
+	for (int t = 0; t < 16; t++)
+		w[t] = ((uint32_t) p[4*t] << 24) | ((uint32_t) p[4*t+1] << 16) | ((uint32_t) p[4*t+2] << 8) | p[4*t+3];
+	for (int t = 16; t < 64; t++)
+		w[t] = w[t-16] + (ROR32_SW(w[t-15],7) ^ ROR32_SW(w[t-15],18) ^ (w[t-15] >> 3)) + w[t-7]
+		     + (ROR32_SW(w[t-2],17) ^ ROR32_SW(w[t-2],19) ^ (w[t-2] >> 10));
+	uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+	for (int t = 0; t < 64; t++) {
+		uint32_t t1 = hh + (ROR32_SW(e,6)^ROR32_SW(e,11)^ROR32_SW(e,25)) + ((e&f)^(~e&g)) + K256_sw[t] + w[t];
+		uint32_t t2 = (ROR32_SW(a,2)^ROR32_SW(a,13)^ROR32_SW(a,22)) + ((a&b)^(a&c)^(b&c));
+		hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+	}
+	h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+}
+static void sha256_sw(const uint8_t* data, uint32_t len, uint8_t out[32]) {
+	uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+	                 0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+	uint32_t full = len / 64, rem = len % 64;
+	for (uint32_t i = 0; i < full; i++) sha256_sw_block(h, data + 64 * i);
+	uint8_t b[128] = {0};
+	memcpy(b, data + 64 * full, rem);
+	b[rem] = 0x80;
+	uint32_t total = (rem >= 56) ? 128 : 64;
+	uint64_t bits = (uint64_t) len * 8;
+	for (int i = 0; i < 8; i++) b[total - 1 - i] = (bits >> (8 * i)) & 0xFF;
+	sha256_sw_block(h, b);
+	if (total == 128) sha256_sw_block(h, b + 64);
+	for (int i = 0; i < 8; i++) {
+		out[4*i] = h[i] >> 24; out[4*i+1] = h[i] >> 16; out[4*i+2] = h[i] >> 8; out[4*i+3] = h[i];
+	}
+}
+static uint64_t Sha_mismatches = 0;
+#endif
+
 // Hash one chunk (len <= MAX_CHUNK_SIZE) on the FPGA.
 static void sha256_fpga(const uint8_t* d, uint32_t len, uint8_t out[32]) {
+	if (len > MAX_CHUNK_SIZE) {
+		fprintf(stderr, "SHA-256 chunk length %u exceeds buffer capacity %u\n",
+		        len, (unsigned) MAX_CHUNK_SIZE);
+		exit(EXIT_FAILURE);
+	}
+
 	cl_int err;
 	cl::Event kev;
 	memcpy(Fpga->in_ptr, d, len);
@@ -120,6 +186,13 @@ static void sha256_fpga(const uint8_t* d, uint32_t len, uint8_t out[32]) {
 	Fpga->calls++;
 
 	memcpy(out, Fpga->out_ptr, SHA256_DIGEST_SIZE);
+
+#ifdef VERIFY_SHA
+	uint8_t ref[32];
+	sha256_sw(d, len, ref);
+	if (memcmp(ref, out, 32) != 0 && Sha_mismatches++ < 10)
+		printf("SHA mismatch on chunk %llu (len %u)\n", (unsigned long long) Fpga->calls - 1, len);
+#endif
 }
 
 // ================================================================ dedup
@@ -315,7 +388,7 @@ int main(int argc, char* argv[]) {
 	ESE532_Server server;
 
 	int blocksize = BLOCKSIZE;
-	const char* outname = "output_cpu.bin";
+	const char* outname = "output_fpga.bin";
 	const char* xclbin = "encoder.xclbin";       // expected next to the executable
 	handle_input(argc, argv, &blocksize, &outname, &xclbin);
 
@@ -336,16 +409,26 @@ int main(int argc, char* argv[]) {
 	cdc_init();
 	server.setup_server(blocksize);
 
+	// First packet is received before any timer starts: recvfrom blocks here until the
+	// client is launched, and that wait is not part of the encoder's run time.
+	int packet_bytes = server.get_packet(input[writer]);
+
 	total_timer.start();
-	while (!done) {
-		ethernet_timer.start();
-		server.get_packet(input[writer]);
-		ethernet_timer.stop();
+	for (;;) {
+		if (packet_bytes < HEADER) {
+			fprintf(stderr, "received invalid UDP packet length %d\n", packet_bytes);
+			return EXIT_FAILURE;
+		}
 
 		unsigned char* buffer = input[writer];
 		done = buffer[1] & DONE_BIT_L;
 		length = buffer[0] | (buffer[1] << 8);
 		length &= ~DONE_BIT_H;
+		if ((uint32_t) length != (uint32_t) (packet_bytes - HEADER)) {
+			fprintf(stderr, "UDP length mismatch: header says %d bytes, received %d\n",
+			        length, packet_bytes - HEADER);
+			return EXIT_FAILURE;
+		}
 
 		auto t0 = std::chrono::steady_clock::now();
 		Push_timer.start();
@@ -357,6 +440,11 @@ int main(int argc, char* argv[]) {
 		bytes_in += length;
 
 		writer = (writer + 1) % NUM_PACKETS;
+		if (done) break;                      // last packet: don't wait for another
+
+		ethernet_timer.start();
+		packet_bytes = server.get_packet(input[writer]);
+		ethernet_timer.stop();
 	}
 	Push_timer.start();
 	cdc_flush();                              // last (possibly short) chunk
@@ -386,6 +474,10 @@ int main(int argc, char* argv[]) {
 	printf("LZW:    %llu unique bytes -> %llu bytes incl. headers (ratio %.3f)\n",
 	       (unsigned long long) Uniq_bytes, (unsigned long long) Lzw_out_bytes,
 	       Lzw_out_bytes ? (double) Uniq_bytes / Lzw_out_bytes : 0.0);
+#ifdef VERIFY_SHA
+	printf("SHA verify: %llu of %llu FPGA digests differ from software\n",
+	       (unsigned long long) Sha_mismatches, (unsigned long long) Fpga->calls);
+#endif
 
 	float sha_ms = Sha_timer.latency(), dedup_ms = Dedup_timer.latency(), lzw_ms = Lzw_timer.latency();
 	float cdc_ms = Push_timer.latency() - sha_ms - dedup_ms - lzw_ms;
@@ -401,14 +493,17 @@ int main(int argc, char* argv[]) {
 	printf("longest single-packet processing: %.2f ms (at input offset %llu)\n",
 	       Max_push_ms, (unsigned long long) Max_push_at);
 
-	std::cout << "--------------- Key Throughputs ---------------" << std::endl;
-	float ethernet_latency = ethernet_timer.latency() / 1000.0;
-	float input_throughput = (bytes_in * 8 / 1000000.0) / ethernet_latency; // Mb/s
-	std::cout << "Input Throughput to Encoder: " << input_throughput << " Mb/s."
-			<< " (Latency: " << ethernet_latency << "s)." << std::endl;
-	if (compute_ms > 0)
-		std::cout << "Compute-only throughput    : "
-				<< (bytes_in * 8 / 1000000.0) / (compute_ms / 1000.0) << " Mb/s." << std::endl;
+	// End-to-end: first packet received -> last chunk encoded (file write excluded).
+	// Compute-only: time inside CDC/SHA/dedup/LZW, i.e. the rate if the network were infinitely fast.
+	// recvfrom time is how long the encoder sat waiting for packets. It is NOT the link rate:
+	// while the encoder computes, packets queue in the socket buffer and recvfrom returns at once.
+	double total_s = total_timer.latency() / 1000.0;
+	printf("--------------- Key Throughputs ---------------\n");
+	printf("End-to-end throughput   : %.2f Mb/s (%.3f s)\n",
+	       total_s > 0 ? bytes_in * 8 / 1e6 / total_s : 0.0, total_s);
+	printf("Compute-only throughput : %.2f Mb/s (%.3f s)\n",
+	       compute_ms > 0 ? bytes_in * 8 / 1e6 / (compute_ms / 1000.0) : 0.0, compute_ms / 1000.0);
+	printf("Time blocked in recvfrom: %.3f s\n", ethernet_timer.latency() / 1000.0);
 
 	opencl_shutdown();
 	for (int i = 0; i < NUM_PACKETS; i++) free(input[i]);
