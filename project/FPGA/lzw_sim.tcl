@@ -1,4 +1,4 @@
-# Run from the project directory with make lzw-cosim.
+# Run from project/FPGA with make lzw-cosim.
 set build_dir $::env(LZW_SIM_DIR)
 set src_dir [file dirname [file normalize [info script]]]
 open_project -reset [file join $build_dir hls]
