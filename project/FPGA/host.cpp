@@ -5,7 +5,6 @@
 //                                                  +-> LZW (FPGA kernel, OpenCL) -> output buffer -> file
 //
 // One kernel call per unique chunk (copy in, run, copy out, wait).
-// Buffers are mapped once at setup; each call only migrates them (Vitis tutorial pattern).
 // Same structure as main's FPGA/host.cpp (SHA on the FPGA); here SHA runs on the ARM and LZW
 // runs on the FPGA.
 // Kernel: lzw_kernel.cpp (lzw_kernel). Build: see Makefile / u96_v2.cfg.
@@ -68,9 +67,6 @@ struct FpgaLzw {
 	cl::CommandQueue q;
 	cl::Kernel       krnl;
 	cl::Buffer       in_buf, payload_buf, count_buf;
-	uint8_t*         in_ptr      = NULL;   // host mapping of in_buf      (LZW_MAX_INPUT bytes)
-	uint8_t*         payload_ptr = NULL;   // host mapping of payload_buf (LZW_MAX_PAYLOAD bytes)
-	uint32_t*        count_ptr   = NULL;   // host mapping of count_buf   (payload size in bytes)
 	uint64_t         kernel_ns = 0;        // sum of kernel execution times (profiling info)
 	uint64_t         calls = 0;
 };
@@ -86,6 +82,8 @@ static void opencl_init(const char* xclbin_name) {
 	auto fileBuf = xcl::read_binary_file(xclbin_name);
 	cl::Program::Binaries bins{{fileBuf.data(), fileBuf.size()}};
 	cl::Device device = devices[0];
+	std::cout << "Programming device " << device.getInfo<CL_DEVICE_NAME>()
+	          << " with " << xclbin_name << " (" << fileBuf.size() << " bytes)" << std::endl;
 	cl::Context context;
 	OCL_CHECK(err, context = cl::Context(device, NULL, NULL, NULL, &err));
 	OCL_CHECK(err, Fpga->q = cl::CommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err));
@@ -99,28 +97,16 @@ static void opencl_init(const char* xclbin_name) {
 	OCL_CHECK(err, Fpga->in_buf      = cl::Buffer(context, CL_MEM_READ_ONLY,  (size_t) LZW_MAX_INPUT,   NULL, &err));
 	OCL_CHECK(err, Fpga->payload_buf = cl::Buffer(context, CL_MEM_WRITE_ONLY, (size_t) LZW_MAX_PAYLOAD, NULL, &err));
 	OCL_CHECK(err, Fpga->count_buf   = cl::Buffer(context, CL_MEM_WRITE_ONLY, sizeof(uint32_t),         NULL, &err));
-	// Map once for the whole run. Each call then only migrates the buffers, which does the
-	// host<->FPGA sync; no per-chunk unmap/re-map is needed.
-	OCL_CHECK(err, Fpga->in_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(
-			Fpga->in_buf, CL_TRUE, CL_MAP_WRITE, 0, LZW_MAX_INPUT, NULL, NULL, &err));
-	OCL_CHECK(err, Fpga->payload_ptr = (uint8_t*) Fpga->q.enqueueMapBuffer(
-			Fpga->payload_buf, CL_TRUE, CL_MAP_READ, 0, LZW_MAX_PAYLOAD, NULL, NULL, &err));
-	OCL_CHECK(err, Fpga->count_ptr = (uint32_t*) Fpga->q.enqueueMapBuffer(
-			Fpga->count_buf, CL_TRUE, CL_MAP_READ, 0, sizeof(uint32_t), NULL, NULL, &err));
 
 	// kernel arguments: 0 = input, 1 = payload, 2 = payload_bytes, 3 = length (set per chunk).
-	// The same cl::Buffer objects are used for setArg, mapping and migration.
 	OCL_CHECK(err, err = Fpga->krnl.setArg(0, Fpga->in_buf));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->payload_buf));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(2, Fpga->count_buf));
 }
 
 static void opencl_shutdown() {
-	cl_int err;
-	OCL_CHECK(err, err = Fpga->q.enqueueUnmapMemObject(Fpga->in_buf,      Fpga->in_ptr));
-	OCL_CHECK(err, err = Fpga->q.enqueueUnmapMemObject(Fpga->payload_buf, Fpga->payload_ptr));
-	OCL_CHECK(err, err = Fpga->q.enqueueUnmapMemObject(Fpga->count_buf,   Fpga->count_ptr));
-	OCL_CHECK(err, err = Fpga->q.finish());
+	if (Fpga == NULL) return;
+	Fpga->q.finish();
 	delete Fpga;
 	Fpga = NULL;
 }
@@ -275,13 +261,15 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 
 	cl_int err;
 	cl::Event kev;
-	memcpy(Fpga->in_ptr, in, len);
 	OCL_CHECK(err, err = Fpga->krnl.setArg(3, len));
-	OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects({Fpga->in_buf}, 0));                // host -> device
+	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf, CL_FALSE, 0, len, in));
 	OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
-	OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects({Fpga->payload_buf, Fpga->count_buf},
-	                                                      CL_MIGRATE_MEM_OBJECT_HOST));      // device -> host
-	OCL_CHECK(err, err = Fpga->q.finish());
+
+	// Reading the four-byte count with CL_TRUE waits for the preceding kernel in this
+	// in-order queue. Read only the payload bytes the kernel says it produced.
+	uint32_t count = 0;
+	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
+			Fpga->count_buf, CL_TRUE, 0, sizeof(count), &count));
 
 	cl_ulong t0 = 0, t1 = 0;
 	OCL_CHECK(err, err = kev.getProfilingInfo(CL_PROFILING_COMMAND_START, &t0));
@@ -290,12 +278,15 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 	Fpga->calls++;
 
 	// len bytes give at most len codes of 13 bits; at least one code (2 bytes) for len >= 1
-	uint32_t count = *Fpga->count_ptr;
 	if (count < 2 || count > (CODE_LENGTH * len + 7) / 8) {
 		fprintf(stderr, "FPGA LZW returned invalid payload size %u for %u input bytes\n", count, len);
+		// Release the XRT buffers explicitly instead of making zocl tear them down from
+		// process-exit cleanup.  The board log shows that cleanup path corrupting mm state.
+		opencl_shutdown();
 		exit(EXIT_FAILURE);
 	}
-	memcpy(out + 4, Fpga->payload_ptr, count);
+	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
+			Fpga->payload_buf, CL_TRUE, 0, count, out + 4));
 	uint32_t header = count << 1;                 // bit0 = 0: LZW chunk, bits 31..1 = length in bytes
 	for (int i = 0; i < 4; i++) out[i] = (header >> (8 * i)) & 0xFF;
 
