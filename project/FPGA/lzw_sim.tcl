@@ -1,7 +1,9 @@
-# Run from project/FPGA with make lzw-cosim.
+# Run with make lzw-cosim from project/FPGA (the recipe cds into the build directory).
 set build_dir $::env(LZW_SIM_DIR)
 set src_dir [file dirname [file normalize [info script]]]
-open_project -reset [file join $build_dir hls]
+# Run from inside $build_dir (the Makefile cds there) so HLS resolves its relative
+# source paths from the same directory it saved them against.
+open_project -reset hls
 set_top lzw_kernel
 add_files [file join $src_dir lzw_kernel.cpp]
 add_files -tb [file join $src_dir lzw_kernel_tb.cpp] -cflags "-std=c++11"

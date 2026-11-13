@@ -77,7 +77,7 @@ lzw-test: $(LZW_BUILD)/lzw_test $(LZW_BUILD)/lzw_seed23.bin
 	cd $(LZW_BUILD) && ./lzw_test
 
 lzw-cosim: lzw-test
-	LZW_SIM_DIR="$(abspath $(LZW_BUILD))" vitis_hls -f lzw_sim.tcl
+	cd $(LZW_BUILD) && LZW_SIM_DIR="$(abspath $(LZW_BUILD))" vitis_hls -f $(abspath lzw_sim.tcl)
 
 clean:
 	-$(RM) $(HOST_EXE) *.o *.xo *.xclbin *.xclbin.sh *.xclbin.info *.xclbin.link_summary* *.compile_summary *.str

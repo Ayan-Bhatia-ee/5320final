@@ -2,29 +2,27 @@
 
 // At most seven bits remain from the previous code, so a 32-bit accumulator
 // holds the next 13-bit code and produces at most two complete bytes.
-static void emit_code(uint32_t code, uint8_t* payload, uint32_t& pos,
+static void emit_code(uint32_t code, uint8_t* output, uint32_t& pos,
                       uint32_t& bits, unsigned& count) {
     bits = (bits << LZW_CODE_BITS) | code;
     count += LZW_CODE_BITS;
     for (int byte = 0; byte < 2 && count >= 8; ++byte) {
         count -= 8;
-        payload[pos++] = static_cast<uint8_t>(bits >> count);
+        output[pos++] = static_cast<uint8_t>(bits >> count);
     }
 }
 
-extern "C" void lzw_kernel(const uint8_t* input, uint8_t* payload,
-                           uint32_t* payload_bytes, uint32_t length) {
+extern "C" void lzw_kernel(const uint8_t* input, uint8_t* output,
+                           uint32_t length) {
 #pragma HLS INTERFACE m_axi port=input         offset=slave bundle=gmem depth=8192
-#pragma HLS INTERFACE m_axi port=payload       offset=slave bundle=gmem depth=13312
-#pragma HLS INTERFACE m_axi port=payload_bytes offset=slave bundle=gmem depth=1
+#pragma HLS INTERFACE m_axi port=output        offset=slave bundle=gmem depth=13316
 #pragma HLS INTERFACE s_axilite port=input         bundle=control
-#pragma HLS INTERFACE s_axilite port=payload       bundle=control
-#pragma HLS INTERFACE s_axilite port=payload_bytes bundle=control
+#pragma HLS INTERFACE s_axilite port=output        bundle=control
 #pragma HLS INTERFACE s_axilite port=length        bundle=control
 #pragma HLS INTERFACE s_axilite port=return        bundle=control
 
     if (length == 0 || length > LZW_MAX_INPUT) {
-        *payload_bytes = 0;
+        output[0] = output[1] = output[2] = output[3] = 0;
         return;
     }
 
@@ -44,7 +42,7 @@ extern "C" void lzw_kernel(const uint8_t* input, uint8_t* payload,
 
     uint32_t next_code = 256;
     uint32_t prefix = input[0];
-    uint32_t pos = 0, bits = 0;
+    uint32_t pos = 4, bits = 0; // reserve the final stream's four-byte chunk header
     unsigned count = 0;
     for (uint32_t i = 1; i < length; ++i) {
         uint8_t c = input[i];
@@ -54,7 +52,7 @@ extern "C" void lzw_kernel(const uint8_t* input, uint8_t* payload,
         // an empty slot before this bounded probe wraps around the table.
         for (unsigned p = 0; p < slots; ++p) {
             if (!valid[slot]) {
-                emit_code(prefix, payload, pos, bits, count);
+                emit_code(prefix, output, pos, bits, count);
                 if (next_code < (1u << LZW_CODE_BITS)) {
                     keys[slot] = key;
                     codes[slot] = next_code++;
@@ -71,7 +69,14 @@ extern "C" void lzw_kernel(const uint8_t* input, uint8_t* payload,
         }
     }
 
-    emit_code(prefix, payload, pos, bits, count);
-    if (count != 0) payload[pos++] = static_cast<uint8_t>(bits << (8 - count));
-    *payload_bytes = pos;
+    emit_code(prefix, output, pos, bits, count);
+    if (count != 0) output[pos++] = static_cast<uint8_t>(bits << (8 - count));
+
+    // Same little-endian record header consumed by Decoder.cpp:
+    // bit 0 = 0 for an LZW record; bits 31:1 = payload size in bytes.
+    uint32_t header = (pos - 4) << 1;
+    output[0] = static_cast<uint8_t>(header);
+    output[1] = static_cast<uint8_t>(header >> 8);
+    output[2] = static_cast<uint8_t>(header >> 16);
+    output[3] = static_cast<uint8_t>(header >> 24);
 }

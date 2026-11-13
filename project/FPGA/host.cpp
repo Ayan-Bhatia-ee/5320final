@@ -60,13 +60,12 @@ static void put_u32(uint32_t v) {       // headers are little endian (matches de
 }
 
 // ================================================================ LZW on the FPGA (OpenCL)
-// Kernel: lzw_kernel(input, payload, payload_bytes, length), see lzw_kernel.h.
-// The kernel writes only the packed 13-bit codes and their byte count; the host adds
-// the 4-byte chunk header, exactly as the software encoder does.
+// Kernel: lzw_kernel(input, output, length), see lzw_kernel.h.
+// The kernel writes the final four-byte chunk header followed by packed 13-bit codes.
 struct FpgaLzw {
 	cl::CommandQueue q;
 	cl::Kernel       krnl;
-	cl::Buffer       in_buf, payload_buf, count_buf;
+	cl::Buffer       in_buf, out_buf;
 	uint64_t         kernel_ns = 0;        // sum of kernel execution times (profiling info)
 	uint64_t         calls = 0;
 };
@@ -94,14 +93,12 @@ static void opencl_init(const char* xclbin_name) {
 	}
 	OCL_CHECK(err, Fpga->krnl = cl::Kernel(program, "lzw_kernel", &err));
 
-	OCL_CHECK(err, Fpga->in_buf      = cl::Buffer(context, CL_MEM_READ_ONLY,  (size_t) LZW_MAX_INPUT,   NULL, &err));
-	OCL_CHECK(err, Fpga->payload_buf = cl::Buffer(context, CL_MEM_WRITE_ONLY, (size_t) LZW_MAX_PAYLOAD, NULL, &err));
-	OCL_CHECK(err, Fpga->count_buf   = cl::Buffer(context, CL_MEM_WRITE_ONLY, sizeof(uint32_t),         NULL, &err));
+	OCL_CHECK(err, Fpga->in_buf  = cl::Buffer(context, CL_MEM_READ_ONLY,  (size_t) LZW_MAX_INPUT,  NULL, &err));
+	OCL_CHECK(err, Fpga->out_buf = cl::Buffer(context, CL_MEM_WRITE_ONLY, (size_t) LZW_MAX_OUTPUT, NULL, &err));
 
-	// kernel arguments: 0 = input, 1 = payload, 2 = payload_bytes, 3 = length (set per chunk).
+	// kernel arguments: 0 = input, 1 = final output, 2 = length (set per chunk).
 	OCL_CHECK(err, err = Fpga->krnl.setArg(0, Fpga->in_buf));
-	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->payload_buf));
-	OCL_CHECK(err, err = Fpga->krnl.setArg(2, Fpga->count_buf));
+	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->out_buf));
 }
 
 static void opencl_shutdown() {
@@ -175,7 +172,7 @@ static int64_t dedup_lookup(const Digest& d) {
 static void dedup_insert(const Digest& d) { Seen[d] = Next_index++; }
 
 // ================================================================ LZW
-#define LZW_OUT_MAX     (4 + LZW_MAX_PAYLOAD)   // 32-bit header + packed codes = 13316 bytes
+#define LZW_OUT_MAX     LZW_MAX_OUTPUT           // 32-bit header + packed codes = 13316 bytes
 
 // Software LZW, used only as the reference for -DVERIFY_LZW. Same algorithm and output
 // format as the kernel: 13-bit codes, MSB-first, dictionary reset per chunk.
@@ -261,18 +258,20 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 
 	cl_int err;
 	cl::Event kev;
-	const uint32_t count_sentinel = 0xA5A55A5Au;
-	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(
-			Fpga->count_buf, CL_FALSE, 0, sizeof(count_sentinel), &count_sentinel));
-	OCL_CHECK(err, err = Fpga->krnl.setArg(3, len));
+	OCL_CHECK(err, err = Fpga->krnl.setArg(2, len));
 	OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf, CL_FALSE, 0, len, in));
 	OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
 
-	// Reading the four-byte count with CL_TRUE waits for the preceding kernel in this
-	// in-order queue. Read only the payload bytes the kernel says it produced.
-	uint32_t count = 0;
+	// Reading the four-byte header with CL_TRUE waits for the preceding kernel in this
+	// in-order queue. The remaining read then transfers only the valid payload bytes.
+	uint8_t header_bytes[4];
 	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
-			Fpga->count_buf, CL_TRUE, 0, sizeof(count), &count));
+			Fpga->out_buf, CL_TRUE, 0, sizeof(header_bytes), header_bytes));
+	uint32_t header = (uint32_t) header_bytes[0] |
+	                  ((uint32_t) header_bytes[1] << 8) |
+	                  ((uint32_t) header_bytes[2] << 16) |
+	                  ((uint32_t) header_bytes[3] << 24);
+	uint32_t count = header >> 1;
 
 	cl_ulong t0 = 0, t1 = 0;
 	OCL_CHECK(err, err = kev.getProfilingInfo(CL_PROFILING_COMMAND_START, &t0));
@@ -281,22 +280,19 @@ static uint32_t lzw_encode_fpga(const uint8_t* in, uint32_t len, uint8_t* out) {
 	Fpga->calls++;
 
 	// len bytes give at most len codes of 13 bits; at least one code (2 bytes) for len >= 1
-	if (count < 2 || count > (CODE_LENGTH * len + 7) / 8) {
+	if ((header & 1) != 0 || count < 2 || count > (CODE_LENGTH * len + 7) / 8) {
 		fprintf(stderr,
-		        "FPGA LZW returned invalid payload size %u (0x%08x) for %u input bytes; "
-		        "kernel event %.1f us%s\n",
-		        count, count, len, (t1 - t0) / 1e3,
-		        count == count_sentinel ? "; payload_bytes was not written" :
-		        count == 0 ? "; kernel wrote zero (length was seen as 0 or > LZW_MAX_INPUT)" : "");
+		        "FPGA LZW returned invalid header 0x%08x (%u payload bytes) "
+		        "for %u input bytes; kernel event %.1f us\n",
+		        header, count, len, (t1 - t0) / 1e3);
 		// Release the XRT buffers explicitly instead of making zocl tear them down from
 		// process-exit cleanup.  The board log shows that cleanup path corrupting mm state.
 		opencl_shutdown();
 		exit(EXIT_FAILURE);
 	}
+	memcpy(out, header_bytes, sizeof(header_bytes));
 	OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(
-			Fpga->payload_buf, CL_TRUE, 0, count, out + 4));
-	uint32_t header = count << 1;                 // bit0 = 0: LZW chunk, bits 31..1 = length in bytes
-	for (int i = 0; i < 4; i++) out[i] = (header >> (8 * i)) & 0xFF;
+			Fpga->out_buf, CL_TRUE, 4, count, out + 4));
 
 #ifdef VERIFY_LZW
 	static uint8_t ref[LZW_OUT_MAX + 16];

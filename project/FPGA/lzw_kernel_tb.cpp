@@ -42,12 +42,18 @@ static Bytes reference_payload(const Bytes& input) {
 static bool check_chunk(const char* name, const Bytes& chunk, const Bytes& expected) {
     // C/RTL co-simulation models the full declared AXI depths for every call.
     uint8_t input[LZW_MAX_INPUT] = {};
-    uint8_t output[LZW_MAX_PAYLOAD] = {};
+    uint8_t output[LZW_MAX_OUTPUT] = {};
     std::copy(chunk.begin(), chunk.end(), input);
-    uint32_t count = UINT32_MAX;
-    lzw_kernel(input, output, &count, chunk.size());
-    if (count != expected.size() || !std::equal(expected.begin(), expected.end(), output)) {
-        std::fprintf(stderr, "%s failed (got %u bytes, expected %zu)\n", name, count, expected.size());
+    lzw_kernel(input, output, chunk.size());
+    uint32_t header = static_cast<uint32_t>(output[0]) |
+                      (static_cast<uint32_t>(output[1]) << 8) |
+                      (static_cast<uint32_t>(output[2]) << 16) |
+                      (static_cast<uint32_t>(output[3]) << 24);
+    uint32_t count = header >> 1;
+    if ((header & 1) != 0 || count != expected.size() ||
+        !std::equal(expected.begin(), expected.end(), output + 4)) {
+        std::fprintf(stderr, "%s failed (header 0x%08x, got %u bytes, expected %zu)\n",
+                     name, header, count, expected.size());
         return false;
     }
     return true;
