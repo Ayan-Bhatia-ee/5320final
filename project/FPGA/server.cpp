@@ -32,6 +32,17 @@ int ESE532_Server::setup_server(int avg_blocksize) {
 			sizeof(opt)))
 		perror("sockopt");
 
+	// Large receive buffer: packets keep queueing in the kernel while the encoder is busy
+	// compressing a chunk, so a burst of packets is not dropped. SO_RCVBUFFORCE (root) is allowed
+	// to exceed net.core.rmem_max; fall back to SO_RCVBUF if it is refused.
+	int rcvbuf = 8 * 1024 * 1024;
+	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0)
+		setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+	int actual = 0;
+	socklen_t alen = sizeof(actual);
+	if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0)
+		printf("socket receive buffer: %d bytes\n", actual);
+
 	// Filling server information
 	//
 	bzero(&servaddr, sizeof(servaddr));
