@@ -398,6 +398,62 @@ static void cdc_flush() {
 	if (Chunk_len > 0) cdc_emit();
 }
 
+// ================================================================ Chunk Ring buffer
+
+#define RING_SIZE 32
+
+struct ChunkSlot {
+	uint8_t data[MAX_CHUNK];
+	uint32_t len = 0;
+};
+
+struct ChunkRing {
+	ChunkSlot slots[RING_SIZE];
+	size_t head = 0;                    // consumer read index
+	size_t tail = 0;                    // producer write index
+	size_t count = 0;                   // number of ready chunks in ring
+	bool   done = false;
+	std::mutex mtx;
+	std::condition_variable cv_not_empty;
+	std::condition_variable cv_not_full;
+
+	// called by CDC, increment tail to push next chunk
+	void commit_and_advance() {
+		std::unique_lock<std::mutex> lock(mtx);
+		tail = (tail + 1) % RING_SIZE;
+		count++;
+		cv_not_empty.notify_one(); // notifies worker
+		cv_not_full.wait(lock, [&] { return count < RING_SIZE; }); 
+	}
+
+	// called by worker thread, returns slot index to process
+	int acquire_read() {
+		std::unique_lock<std::mutex> lock(mtx);
+		cv_not_empty.wait(lock, [&] { return count > 0 || done; }); // put worker to sleep if false condition
+		if (count == 0 && done) return -1;
+		return (int) head;
+	}
+
+	// called by worker thread after process_chunk() finishes reading slots[idx]
+	void release_read() {
+		std::unique_lock<std::mutex> lock(mtx);
+		head = (head + 1) % RING_SIZE;
+		count--;
+		cv_not_full.notify_one(); // releases lock, notifies producer
+	}
+
+	// called by main thread after cdc_flush()
+	void finish() {
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			done = true;
+		}
+		cv_not_empty.notify_all();
+	}
+
+};
+
+
 // ================================================================ main / input
 void handle_input(int argc, char* argv[], int* blocksize, const char** outname, const char** xclbin) {
 	int x;
