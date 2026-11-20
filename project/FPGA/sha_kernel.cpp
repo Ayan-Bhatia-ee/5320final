@@ -63,27 +63,21 @@ static void sha256_kernel_block(uint32_t h[8], const uint32_t block_words[16]) {
 	h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }
 
-void sha256_kernel(const uint32_t* input_data, uint32_t* output_digest, uint32_t length) {
-	#pragma HLS INTERFACE m_axi port=input_data    offset=slave bundle=gmem0 depth=2048
-	#pragma HLS INTERFACE m_axi port=output_digest offset=slave bundle=gmem1 depth=8
-
-	#pragma HLS INTERFACE s_axilite port=input_data    bundle=control
-	#pragma HLS INTERFACE s_axilite port=output_digest bundle=control
-	#pragma HLS INTERFACE s_axilite port=length        bundle=control
-	#pragma HLS INTERFACE s_axilite port=return        bundle=control
-
-	uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-	                 0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-	#pragma HLS ARRAY_PARTITION variable=h complete dim=1
+// Hash one chunk of `length` bytes that starts at in[0] (word aligned) and leave the digest in h.
+static void sha256_one_chunk(const uint32_t* in, uint32_t length, uint32_t h[8]) {
+	#pragma HLS INLINE off
+	h[0] = 0x6a09e667; h[1] = 0xbb67ae85; h[2] = 0x3c6ef372; h[3] = 0xa54ff53a;
+	h[4] = 0x510e527f; h[5] = 0x9b05688c; h[6] = 0x1f83d9ab; h[7] = 0x5be0cd19;
 
 	// 32 words headroom ensures 8192-byte chunks can append the 129th padding block safely
-	uint32_t local_words[(MAX_CHUNK_SIZE / 4) + 32];
+	uint32_t local_words[MAX_CHUNK_WORDS + 32];
 
 	// Burst-read 32-bit words from DRAM (4 bytes/cycle)
 	uint32_t num_in_words = (length + 3) >> 2;
 	for (uint32_t i = 0; i < num_in_words; i++) {
 		#pragma HLS PIPELINE II=1
-		local_words[i] = bswap32(input_data[i]);
+		#pragma HLS LOOP_TRIPCOUNT min=1 max=2048 avg=800
+		local_words[i] = bswap32(in[i]);
 	}
 
 	// Mask out unaligned trailing bytes and append SHA-256 0x80 + bit-length padding
@@ -100,6 +94,7 @@ void sha256_kernel(const uint32_t* input_data, uint32_t* output_digest, uint32_t
 
 	for (uint32_t i = last_word_idx + 1; i < len_word_idx; i++) {
 		#pragma HLS PIPELINE II=1
+		#pragma HLS LOOP_TRIPCOUNT min=0 max=16 avg=8
 		local_words[i] = 0;
 	}
 
@@ -109,12 +104,54 @@ void sha256_kernel(const uint32_t* input_data, uint32_t* output_digest, uint32_t
 
 	// Process all 16-word (64-byte) blocks
 	for (uint32_t b = 0; b < total_blocks; b++) {
+		#pragma HLS LOOP_TRIPCOUNT min=1 max=129 avg=51
 		sha256_kernel_block(h, local_words + (b << 4));
 	}
+}
 
-	// 4. Write 256-bit digest back in 8 beats
-	for (int i = 0; i < 8; i++) {
-		#pragma HLS UNROLL
-		output_digest[i] = bswap32(h[i]);
+// Batched top function: hashes num_chunks chunks per call (layout in sha_kernel.h).
+void sha256_kernel(const uint32_t* input_data, uint32_t* output_digest, uint32_t num_chunks) {
+	#pragma HLS INTERFACE m_axi port=input_data    offset=slave bundle=gmem0 depth=65568 max_read_burst_length=64
+	#pragma HLS INTERFACE m_axi port=output_digest offset=slave bundle=gmem1 depth=256
+
+	#pragma HLS INTERFACE s_axilite port=input_data    bundle=control
+	#pragma HLS INTERFACE s_axilite port=output_digest bundle=control
+	#pragma HLS INTERFACE s_axilite port=num_chunks    bundle=control
+	#pragma HLS INTERFACE s_axilite port=return        bundle=control
+
+	if (num_chunks > SHA_BATCH_MAX_CHUNKS) num_chunks = SHA_BATCH_MAX_CHUNKS;   // never read past the buffer
+
+	// 1. Chunk lengths: the first num_chunks words of the buffer (one short burst)
+	uint32_t lens[SHA_BATCH_MAX_CHUNKS];
+	for (uint32_t i = 0; i < num_chunks; i++) {
+		#pragma HLS PIPELINE II=1
+		#pragma HLS LOOP_TRIPCOUNT min=1 max=32 avg=32
+		lens[i] = input_data[i];
+	}
+
+	// 2. Hash each chunk; chunk data starts after the length header, each chunk word aligned
+	uint32_t digests[SHA_BATCH_OUT_WORDS];
+	uint32_t word_off = SHA_BATCH_HDR_WORDS;
+	for (uint32_t c = 0; c < num_chunks; c++) {
+		#pragma HLS LOOP_TRIPCOUNT min=1 max=32 avg=32
+		uint32_t length = lens[c];
+		if (length > MAX_CHUNK_SIZE) length = MAX_CHUNK_SIZE;   // guard: host never sends more
+
+		uint32_t h[8];
+		#pragma HLS ARRAY_PARTITION variable=h complete dim=1
+		sha256_one_chunk(input_data + word_off, length, h);
+
+		for (int i = 0; i < 8; i++) {
+			#pragma HLS PIPELINE II=1
+			digests[8 * c + i] = bswap32(h[i]);
+		}
+		word_off += (length + 3) >> 2;
+	}
+
+	// 3. Write all digests back in one burst
+	for (uint32_t i = 0; i < num_chunks * 8; i++) {
+		#pragma HLS PIPELINE II=1
+		#pragma HLS LOOP_TRIPCOUNT min=8 max=256 avg=256
+		output_digest[i] = digests[i];
 	}
 }

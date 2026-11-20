@@ -5,14 +5,18 @@
 //                                                  +-> LZW (ARM) -> output buffer -> file
 //
 // Baseline version: one kernel call per chunk (copy in, run, copy out, wait).
+// Batching (step 4): one kernel call hashes up to SHA_BATCH_MAX_CHUNKS chunks (layout in sha_kernel.h), which
+// spreads the OpenCL call overhead (~200 us per call) over the whole batch.
 // Pipeline (step 2): main thread = recvfrom + CDC (core 0) -> Ring1 -> SHA thread = SHA + dedup (core 1)
-// -> Ring2 -> LZW thread = LZW + output (core 2). Each ring has one producer and one consumer, so chunks
-// stay in order and the output is unchanged.
-// Double buffering (step 3): the SHA thread keeps one chunk on the FPGA while it prepares the next one in the
-// second buffer pair, then collects / dedups the previous chunk while the kernel runs (no q.finish() per chunk).
+// -> Ring2 -> LZW threads = LZW + output (cores 2 and 3). Ring1 has one producer and one consumer. Ring2 has one
+// producer and NUM_LZW_WORKERS consumers (step 5): each worker takes the next waiting chunk and encodes it into
+// that slot's own output buffer; finished records are appended to Output strictly in chunk order, so the
+// output is unchanged.
+// Double buffering (step 3): the SHA thread keeps one batch on the FPGA while it fills the next one in the
+// second buffer pair, then collects / dedups the previous batch while the kernel runs (no q.finish() per batch).
 // Kernel: sha_kernel.cpp (sha256_kernel). Build: see Makefile / u96_v2.cfg.
 // Usage:  ./encoder [-b blocksize] [-c] [-r] [-n] <compressed output file> [xclbin]   (xclbin defaults to encoder.xclbin)
-//         -n: one chunk at a time on the FPGA (no double buffering), for comparison
+//         -n: one chunk at a time on the FPGA (no batching, no double buffering), for comparison
 
 #include "encoder.h"
 #include "xcl2.hpp"          // OpenCL utility layer (includes CL/cl2.hpp)
@@ -55,21 +59,16 @@ typedef std::vector<uint8_t> bytes;
 // ---------------------------------------------------------------- statistics / timers
 static uint64_t Total_chunks = 0, Dup_chunks = 0;
 static uint64_t Dup_bytes = 0, Uniq_bytes = 0, Lzw_out_bytes = 0;
-static stopwatch Push_timer, Sha_timer, Dedup_timer, Lzw_timer;
+static stopwatch Push_timer, Sha_timer, Dedup_timer;
 static stopwatch Ring_full_timer;       // main thread: handing chunks to the SHA thread (incl. waiting on a full Ring1)
 static stopwatch Sha_stage_timer;       // SHA thread: busy time (SHA + dedup + copy into Ring2)
-static stopwatch Ring2_full_timer;      // SHA thread: handing chunks to the LZW thread (incl. waiting on a full Ring2)
-static stopwatch Lzw_stage_timer;       // LZW thread: busy time (LZW + appending to Output)
+static stopwatch Ring2_full_timer;      // SHA thread: handing chunks to the LZW threads (incl. waiting on a full Ring2)
 static stopwatch Fpga_wait_timer;       // SHA thread: time blocked waiting for the FPGA to finish a chunk
 static double Max_push_ms = 0;          // longest time one packet kept us from calling recvfrom
 static uint64_t Max_push_at = 0;        // input byte offset where that happened
 
 // ---------------------------------------------------------------- output buffer
-static bytes Output;
-
-static void put_u32(uint32_t v) {       // headers are little endian (matches decoder on ARM/x86)
-	for (int i = 0; i < 4; i++) Output.push_back((v >> (8 * i)) & 0xFF);
-}
+static bytes Output;                    // appended only by Ring2's in-order drain (under Ring2's lock)
 
 // ================================================================ debug options
 //   -c : also hash every chunk in software, compare with the FPGA digest, report mismatches,
@@ -183,12 +182,13 @@ struct FpgaSha {
 	cl::CommandQueue q;
 	cl::Kernel       krnl;
 	cl::Buffer       in_buf[NBUF], out_buf[NBUF];
-	uint8_t*         in_ptr[NBUF]  = {NULL, NULL};   // host mappings of in_buf  (<= MAX_CHUNK_SIZE bytes)
-	uint8_t*         out_ptr[NBUF] = {NULL, NULL};   // host mappings of out_buf (32-byte digest)
+	uint8_t*         in_ptr[NBUF]  = {NULL, NULL};   // host mappings of in_buf  (SHA_BATCH_IN_BYTES: lengths + chunk data)
+	uint8_t*         out_ptr[NBUF] = {NULL, NULL};   // host mappings of out_buf (SHA_BATCH_OUT_BYTES: 32 bytes per chunk)
 	cl::Event        in_ev[NBUF], krnl_ev[NBUF], out_ev[NBUF];   // per buffer pair (double-buffered path)
 	bool             out_of_order = false;  // queue created with CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE
 	uint64_t         kernel_ns = 0;        // sum of kernel execution times (profiling info)
-	uint64_t         calls = 0;
+	uint64_t         calls = 0;            // kernel calls (batches)
+	uint64_t         chunks = 0;           // chunks hashed on the FPGA
 };
 static FpgaSha* Fpga = NULL;
 
@@ -224,17 +224,17 @@ static void opencl_init(const char* xclbin_name) {
 	OCL_CHECK(err, Fpga->krnl = cl::Kernel(program, "sha256_kernel", &err));
 
 	for (int b = 0; b < NBUF; b++) {
-		OCL_CHECK(err, Fpga->in_buf[b]  = cl::Buffer(context, CL_MEM_READ_ONLY,  MAX_CHUNK_SIZE,     NULL, &err));
-		OCL_CHECK(err, Fpga->out_buf[b] = cl::Buffer(context, CL_MEM_WRITE_ONLY, SHA256_DIGEST_SIZE, NULL, &err));
+		OCL_CHECK(err, Fpga->in_buf[b]  = cl::Buffer(context, CL_MEM_READ_ONLY,  SHA_BATCH_IN_BYTES,  NULL, &err));
+		OCL_CHECK(err, Fpga->out_buf[b] = cl::Buffer(context, CL_MEM_WRITE_ONLY, SHA_BATCH_OUT_BYTES, NULL, &err));
 		if (!Use_rw) {
 			// input mapped read+write: the SHA thread copies unique chunks back out of it for LZW
-			Fpga->in_ptr[b]  = (uint8_t*) Fpga->q.enqueueMapBuffer(Fpga->in_buf[b],  CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, MAX_CHUNK_SIZE);
-			Fpga->out_ptr[b] = (uint8_t*) Fpga->q.enqueueMapBuffer(Fpga->out_buf[b], CL_TRUE, CL_MAP_READ, 0, SHA256_DIGEST_SIZE);
+			Fpga->in_ptr[b]  = (uint8_t*) Fpga->q.enqueueMapBuffer(Fpga->in_buf[b],  CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, SHA_BATCH_IN_BYTES);
+			Fpga->out_ptr[b] = (uint8_t*) Fpga->q.enqueueMapBuffer(Fpga->out_buf[b], CL_TRUE, CL_MAP_READ, 0, SHA_BATCH_OUT_BYTES);
 		}
 	}
 
-	// kernel arguments: 0 = input_data, 1 = output_digest, 2 = length (set per chunk).
-	// The sequential paths always use buffer pair 0; the double-buffered path sets 0 and 1 per chunk.
+	// kernel arguments: 0 = input_data, 1 = output_digest, 2 = num_chunks (set per call).
+	// The sequential paths always use buffer pair 0; the batched path sets 0 and 1 per batch.
 	OCL_CHECK(err, err = Fpga->krnl.setArg(0, Fpga->in_buf[0]));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->out_buf[0]));
 }
@@ -262,24 +262,27 @@ static void add_kernel_time(const cl::Event& kev) {
 }
 
 // ---------------------------------------------------------------- sequential path (-r, -n)
-// Hash one chunk (len <= MAX_CHUNK_SIZE) on the FPGA and wait for it. Uses buffer pair 0.
+// Hash one chunk (len <= MAX_CHUNK_SIZE) on the FPGA and wait for it: a batch of one. Uses buffer pair 0.
 static void sha256_fpga(const uint8_t* d, uint32_t len, uint8_t out[32]) {
 	cl_int err;
 	cl::Event kev;
 	uint8_t hw[32];
+	const uint32_t one = 1;
 
-	OCL_CHECK(err, err = Fpga->krnl.setArg(2, len));
+	OCL_CHECK(err, err = Fpga->krnl.setArg(2, one));
 	if (Use_rw) {
 		if (Check_sha) {                      // pre-fill the digest with 0xAA: if it is still 0xAA afterwards the kernel never wrote it
 			uint8_t sentinel[32];
 			memset(sentinel, 0xAA, sizeof sentinel);
 			OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->out_buf[0], CL_TRUE, 0, SHA256_DIGEST_SIZE, sentinel));
 		}
-		OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf[0], CL_TRUE, 0, len, d));
+		OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf[0], CL_TRUE, 0, sizeof len, &len));   // length header
+		OCL_CHECK(err, err = Fpga->q.enqueueWriteBuffer(Fpga->in_buf[0], CL_TRUE, SHA_BATCH_HDR_WORDS * 4, len, d));
 		OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
 		OCL_CHECK(err, err = Fpga->q.enqueueReadBuffer(Fpga->out_buf[0], CL_TRUE, 0, SHA256_DIGEST_SIZE, hw));
 	} else {
-		memcpy(Fpga->in_ptr[0], d, len);
+		((uint32_t*) Fpga->in_ptr[0])[0] = len;                                                  // length header
+		memcpy(Fpga->in_ptr[0] + SHA_BATCH_HDR_WORDS * 4, d, len);
 		OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects({Fpga->in_buf[0]}, 0));            // host -> device
 		OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, NULL, &kev));
 		OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects({Fpga->out_buf[0]}, CL_MIGRATE_MEM_OBJECT_HOST));
@@ -290,17 +293,38 @@ static void sha256_fpga(const uint8_t* d, uint32_t len, uint8_t out[32]) {
 	if (!Use_rw) memcpy(hw, Fpga->out_ptr[0], SHA256_DIGEST_SIZE);
 
 	add_kernel_time(kev);
+	Fpga->chunks++;
 	check_digest(d, len, hw, out);
 }
 
-// ---------------------------------------------------------------- double-buffered path (default)
-// Start hashing the chunk already copied into Fpga->in_ptr[k]; returns without waiting.
-static void fpga_submit(int k, uint32_t len) {
+// ---------------------------------------------------------------- batched, double-buffered path (default)
+// One batch per buffer pair: chunk c of the batch is in_ptr[k] + off[c], len[c] bytes; its digest comes back
+// at out_ptr[k] + 32 * c.
+struct ShaBatch {
+	uint32_t n = 0;                                // chunks in the batch
+	uint32_t data_words = 0;                       // words of chunk data used so far (after the length header)
+	uint32_t off[SHA_BATCH_MAX_CHUNKS];            // byte offset of each chunk in in_ptr[k]
+	uint32_t len[SHA_BATCH_MAX_CHUNKS];            // length of each chunk in bytes
+};
+
+// Append one chunk to batch k (buffer pair k): length into the header, data word aligned after the previous chunk.
+static void batch_add(ShaBatch& B, int k, const uint8_t* d, uint32_t len) {
+	uint32_t off = (SHA_BATCH_HDR_WORDS + B.data_words) * 4;
+	memcpy(Fpga->in_ptr[k] + off, d, len);
+	((uint32_t*) Fpga->in_ptr[k])[B.n] = len;
+	B.off[B.n] = off;
+	B.len[B.n] = len;
+	B.n++;
+	B.data_words += (len + 3) / 4;
+}
+
+// Start hashing the n chunks already in Fpga->in_ptr[k]; returns without waiting.
+static void fpga_submit(int k, uint32_t n) {
 	cl_int err;
-	// OpenCL captures the argument values at enqueue time, so re-setting them for the next chunk is safe
+	// OpenCL captures the argument values at enqueue time, so re-setting them for the next batch is safe
 	OCL_CHECK(err, err = Fpga->krnl.setArg(0, Fpga->in_buf[k]));
 	OCL_CHECK(err, err = Fpga->krnl.setArg(1, Fpga->out_buf[k]));
-	OCL_CHECK(err, err = Fpga->krnl.setArg(2, len));
+	OCL_CHECK(err, err = Fpga->krnl.setArg(2, n));
 	OCL_CHECK(err, err = Fpga->q.enqueueMigrateMemObjects({Fpga->in_buf[k]}, 0, NULL, &Fpga->in_ev[k]));
 	std::vector<cl::Event> after_in{Fpga->in_ev[k]};
 	OCL_CHECK(err, err = Fpga->q.enqueueTask(Fpga->krnl, &after_in, &Fpga->krnl_ev[k]));
@@ -310,16 +334,21 @@ static void fpga_submit(int k, uint32_t len) {
 	OCL_CHECK(err, err = Fpga->q.flush());     // send the commands to the device now
 }
 
-// Wait for buffer pair k's chunk and return its digest. After this, buffer pair k may be reused.
-static void fpga_collect(int k, uint32_t len, uint8_t out[32]) {
+// Wait for buffer pair k's batch; afterwards its digests are at out_ptr[k] (read them with batch_digest).
+static void fpga_wait(int k, uint32_t n) {
 	cl_int err;
 	Fpga_wait_timer.start();
 	OCL_CHECK(err, err = Fpga->out_ev[k].wait());
 	Fpga_wait_timer.stop();
-	uint8_t hw[32];
-	memcpy(hw, Fpga->out_ptr[k], SHA256_DIGEST_SIZE);
 	add_kernel_time(Fpga->krnl_ev[k]);
-	check_digest(Fpga->in_ptr[k], len, hw, out);
+	Fpga->chunks += n;
+}
+
+// Digest of chunk c of the finished batch in buffer pair k.
+static void batch_digest(const ShaBatch& B, int k, uint32_t c, uint8_t out[32]) {
+	uint8_t hw[32];
+	memcpy(hw, Fpga->out_ptr[k] + SHA256_DIGEST_SIZE * c, SHA256_DIGEST_SIZE);
+	check_digest(Fpga->in_ptr[k] + B.off[c], B.len[c], hw, out);
 }
 
 // ================================================================ dedup
@@ -343,30 +372,42 @@ static void dedup_insert(const Digest& d) { Seen[d] = Next_index++; }
 // ================================================================ LZW
 // Dictionary: open-addressed hash table keyed by (prefix_code << 8 | next_byte).
 // A generation counter "clears" it per chunk without touching the memory.
+// Each LZW worker thread has its own dictionary and statistics (struct LzwWorker), so workers share nothing
+// while encoding.
 #define LZW_MAX_CODES   (1 << CODE_LENGTH)      // codes 0..8191
 #define LZW_TABLE_BITS  14                      // 16384 slots, load <= 0.5
 #define LZW_TABLE_SIZE  (1 << LZW_TABLE_BITS)
 #define LZW_OUT_MAX     (4 + (CODE_LENGTH * MAX_CHUNK + 7) / 8)   // 13316 bytes
 
-struct LzwSlot { uint32_t gen; uint32_t key; uint16_t code; };
-static LzwSlot  Lzw_table[LZW_TABLE_SIZE];      // gen 0 = never used
-static uint32_t Lzw_gen = 0;
+#define NUM_LZW_WORKERS 2                       // LZW threads, pinned to cores 2 .. 2 + NUM_LZW_WORKERS - 1
+
+struct LzwEntry { uint32_t gen; uint32_t key; uint16_t code; };
+
+struct LzwWorker {                              // everything one LZW thread owns
+	LzwEntry  table[LZW_TABLE_SIZE];            // gen 0 = never used
+	uint32_t  gen = 0;
+	uint64_t  uniq_bytes = 0, out_bytes = 0;    // summed into Uniq_bytes / Lzw_out_bytes after join()
+	stopwatch lzw_timer;                        // lzw_encode only
+	stopwatch stage_timer;                      // busy: encode + hand the record back to Ring2 (in-order append)
+	uint64_t  chunks = 0;                       // records produced (unique + duplicate)
+};
+static LzwWorker Lzw_workers[NUM_LZW_WORKERS];
 
 static inline uint32_t lzw_slot(uint32_t key) {
 	return (key * 2654435761u) >> (32 - LZW_TABLE_BITS);
 }
-static int lzw_find(uint32_t key) {
+static int lzw_find(const LzwWorker& W, uint32_t key) {
 	uint32_t s = lzw_slot(key);
-	while (Lzw_table[s].gen == Lzw_gen) {
-		if (Lzw_table[s].key == key) return Lzw_table[s].code;
+	while (W.table[s].gen == W.gen) {
+		if (W.table[s].key == key) return W.table[s].code;
 		s = (s + 1) & (LZW_TABLE_SIZE - 1);
 	}
 	return -1;
 }
-static void lzw_insert(uint32_t key, uint16_t code) {
+static void lzw_insert(LzwWorker& W, uint32_t key, uint16_t code) {
 	uint32_t s = lzw_slot(key);
-	while (Lzw_table[s].gen == Lzw_gen) s = (s + 1) & (LZW_TABLE_SIZE - 1);
-	Lzw_table[s].gen = Lzw_gen; Lzw_table[s].key = key; Lzw_table[s].code = code;
+	while (W.table[s].gen == W.gen) s = (s + 1) & (LZW_TABLE_SIZE - 1);
+	W.table[s].gen = W.gen; W.table[s].key = key; W.table[s].code = code;
 }
 
 struct BitWriter { uint8_t* out; uint32_t pos; uint32_t acc; int nbits; };
@@ -382,9 +423,9 @@ static inline void put_code(BitWriter& w, uint32_t code) {   // MSB-first packin
 }
 
 // Writes [32b header][packed codes] to out (>= LZW_OUT_MAX bytes). Returns total bytes written.
-static uint32_t lzw_encode(const uint8_t* in, uint32_t len, uint8_t* out) {
+static uint32_t lzw_encode(LzwWorker& W, const uint8_t* in, uint32_t len, uint8_t* out) {
 	if (len == 0) return 0;
-	Lzw_gen++;
+	W.gen++;
 	BitWriter w = {out, 4, 0, 0};                 // leave 4 bytes for the header
 	uint32_t next_code = 256;
 	uint32_t prefix = in[0];
@@ -392,13 +433,13 @@ static uint32_t lzw_encode(const uint8_t* in, uint32_t len, uint8_t* out) {
 	for (uint32_t i = 1; i < len; i++) {
 		uint32_t c = in[i];
 		uint32_t key = (prefix << 8) | c;
-		int code = lzw_find(key);
+		int code = lzw_find(W, key);
 		if (code >= 0) {
 			prefix = code;
 		} else {
 			put_code(w, prefix);
 			if (next_code < LZW_MAX_CODES)        // dictionary full: stop adding (decoder never refers past it)
-				lzw_insert(key, next_code++);
+				lzw_insert(W, key, next_code++);
 			prefix = c;
 		}
 	}
@@ -411,7 +452,6 @@ static uint32_t lzw_encode(const uint8_t* in, uint32_t len, uint8_t* out) {
 }
 
 // ================================================================ per-chunk path
-static uint8_t Lzw_buf[LZW_OUT_MAX + 16];
 
 // SHA thread: decide duplicate / unique from the digest. Must run in chunk order (Next_index).
 static bool dedup_chunk(const Digest& dg, uint32_t len, uint32_t* dup_idx) {
@@ -440,30 +480,29 @@ static bool sha_dedup_chunk(const uint8_t* d, uint32_t len, uint32_t* dup_idx) {
 	return dedup_chunk(dg, len, dup_idx);
 }
 
-// LZW thread: write the chunk's record to Output, in chunk order.
-static void lzw_chunk(const uint8_t* d, uint32_t len, bool dup, uint32_t dup_idx) {
+// LZW thread: build the chunk's output record in out (>= LZW_OUT_MAX bytes); returns its length.
+// Ring2 appends the records to Output in chunk order.
+static uint32_t lzw_record(LzwWorker& W, const uint8_t* d, uint32_t len, bool dup, uint32_t dup_idx, uint8_t* out) {
 	if (dup) {
-		put_u32((dup_idx << 1) | 1);              // bit0 = 1: duplicate of LZW chunk dup_idx
-		return;
+		uint32_t v = (dup_idx << 1) | 1;          // bit0 = 1: duplicate of LZW chunk dup_idx
+		for (int i = 0; i < 4; i++) out[i] = (v >> (8 * i)) & 0xFF;   // little endian (matches decoder on ARM/x86)
+		return 4;
 	}
-	Lzw_timer.start();
-	uint32_t n = lzw_encode(d, len, Lzw_buf);
-	Lzw_timer.stop();
-
-	Output.insert(Output.end(), Lzw_buf, Lzw_buf + n);
-	Uniq_bytes += len;
-	Lzw_out_bytes += n;
+	W.lzw_timer.start();
+	uint32_t n = lzw_encode(W, d, len, out);
+	W.lzw_timer.stop();
+	W.uniq_bytes += len;
+	W.out_bytes += n;
+	return n;
 }
 
 // ================================================================ Chunk Ring buffer
 
-#define RING_SIZE 32
+#define RING_SIZE 64                     // > SHA_BATCH_MAX_CHUNKS, so Ring2 can absorb a whole batch
 
-struct ChunkSlot {
+struct ChunkSlot {                       // Ring1: CDC -> SHA thread
 	uint8_t data[MAX_CHUNK];
 	uint32_t len = 0;
-	bool     dup = false;                 // Ring2 only: chunk is a duplicate (data not copied)
-	uint32_t dup_idx = 0;                 // Ring2 only: index of the earlier LZW chunk
 };
 
 struct ChunkRing {
@@ -476,7 +515,7 @@ struct ChunkRing {
 	std::condition_variable cv_not_empty;
 	std::condition_variable cv_not_full;
 
-	// called by the producer (CDC for Ring1, SHA thread for Ring2) after filling slots[tail]
+	// called by the producer (CDC) after filling slots[tail]
 	void commit_and_advance() {
 		std::unique_lock<std::mutex> lock(mtx);
 		tail = (tail + 1) % RING_SIZE;
@@ -485,7 +524,7 @@ struct ChunkRing {
 		cv_not_full.wait(lock, [&] { return count < RING_SIZE; }); 
 	}
 
-	// called by the consumer (SHA thread for Ring1, LZW thread for Ring2), returns slot index to process
+	// called by the consumer (SHA thread), returns slot index to process
 	int acquire_read() {
 		std::unique_lock<std::mutex> lock(mtx);
 		cv_not_empty.wait(lock, [&] { return count > 0 || done; }); // put consumer to sleep if false condition
@@ -513,7 +552,80 @@ struct ChunkRing {
 };
 
 static ChunkRing Ring1;                  // CDC (main thread)        -> SHA + dedup (SHA thread)
-static ChunkRing Ring2;                  // SHA + dedup (SHA thread) -> LZW (LZW thread)
+
+// Ring2: SHA thread -> NUM_LZW_WORKERS LZW threads, records leave in chunk order.
+// Slot life cycle: the SHA thread fills slots[tail] and commits it; a worker claims it (claim_next), encodes
+// into its out[] and calls finish_slot; finish_slot appends every finished slot at the front (head) to Output,
+// in order, and only then frees it. A slot is never reused before its record is in Output.
+struct Ring2Slot {
+	uint8_t  data[MAX_CHUNK];
+	uint32_t len = 0;
+	bool     dup = false;                 // chunk is a duplicate (data not copied)
+	uint32_t dup_idx = 0;                 // index of the earlier LZW chunk
+	uint8_t  out[LZW_OUT_MAX + 16];       // this chunk's output record, written by the worker that claimed it
+	uint32_t out_len = 0;
+	bool     encoded = false;             // out[] complete (set under mtx)
+};
+
+struct LzwRing {
+	Ring2Slot slots[RING_SIZE];
+	size_t head = 0;                    // oldest slot whose record is not yet in Output
+	size_t claim = 0;                   // next committed slot to hand to a worker
+	size_t tail = 0;                    // producer write index
+	size_t count = 0;                   // slots in use: committed and not yet appended to Output
+	size_t unclaimed = 0;               // committed slots no worker has taken yet
+	bool   done = false;
+	std::mutex mtx;
+	std::condition_variable cv_work;      // workers: a slot was committed, or done
+	std::condition_variable cv_not_full;  // producer: a slot was freed
+
+	// producer (SHA thread) after filling slots[tail]; same interface as ChunkRing
+	void commit_and_advance() {
+		std::unique_lock<std::mutex> lock(mtx);
+		slots[tail].encoded = false;
+		tail = (tail + 1) % RING_SIZE;
+		count++;
+		unclaimed++;
+		cv_work.notify_one();
+		cv_not_full.wait(lock, [&] { return count < RING_SIZE; });   // slots[tail] free for the next chunk
+	}
+
+	// worker: take the next committed slot; -1 when the producer is done and nothing is left
+	int claim_next() {
+		std::unique_lock<std::mutex> lock(mtx);
+		cv_work.wait(lock, [&] { return unclaimed > 0 || done; });
+		if (unclaimed == 0) return -1;
+		int i = (int) claim;
+		claim = (claim + 1) % RING_SIZE;
+		unclaimed--;
+		return i;
+	}
+
+	// worker: slots[i].out is ready. Append every finished slot at the front to Output (chunk order), free them.
+	void finish_slot(int i) {
+		std::unique_lock<std::mutex> lock(mtx);
+		slots[i].encoded = true;
+		bool freed = false;
+		while (count > 0 && slots[head].encoded) {
+			const Ring2Slot& s = slots[head];
+			Output.insert(Output.end(), s.out, s.out + s.out_len);
+			head = (head + 1) % RING_SIZE;
+			count--;
+			freed = true;
+		}
+		if (freed) cv_not_full.notify_one();
+	}
+
+	// producer: no more chunks
+	void finish() {
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			done = true;
+		}
+		cv_work.notify_all();
+	}
+};
+static LzwRing Ring2;
 
 // ================================================================ CDC
 // Streaming: state persists across packets so chunks may span packet boundaries.
@@ -562,7 +674,8 @@ static void cdc_flush() {
 // ================================================================ pipeline stages 2 and 3
 // Ownership (no locks needed beyond the rings; main reads everything after join()):
 //   SHA thread: OpenCL queue (Fpga), Seen, Next_index, Total/Dup counters, Sha/Dedup timers, -c state
-//   LZW thread: Output, Lzw_table, Lzw_buf, Uniq_bytes, Lzw_out_bytes, Lzw timer
+//   LZW threads: their own LzwWorker (dictionary, counters, timers) and the Ring2 slot they claimed;
+//                Output is appended only inside Ring2.finish_slot (under Ring2's lock)
 // Sequential (-r, -n): one chunk on the FPGA at a time.
 static void sha_worker_seq() {
 	for (;;) {
@@ -570,7 +683,7 @@ static void sha_worker_seq() {
 		if (idx < 0) break;                   // Ring1 finished and empty
 		Sha_stage_timer.start();
 		const ChunkSlot& in = Ring1.slots[idx];
-		ChunkSlot& out = Ring2.slots[Ring2.tail];   // always free: commit_and_advance() waits until it is
+		Ring2Slot& out = Ring2.slots[Ring2.tail];   // always free: commit_and_advance() waits until it is
 		out.dup = sha_dedup_chunk(in.data, in.len, &out.dup_idx);
 		out.len = in.len;
 		if (!out.dup) memcpy(out.data, in.data, in.len);   // duplicates only need the index
@@ -580,60 +693,84 @@ static void sha_worker_seq() {
 		Ring2.commit_and_advance();           // blocks only while Ring2 is full
 		Ring2_full_timer.stop();
 	}
-	Ring2.finish();                           // tell the LZW thread no more chunks are coming
+	Ring2.finish();                           // tell the LZW threads no more chunks are coming
 }
 
-// Double-buffered (default). Iteration i: copy chunk i into buffer pair i%2 and submit it, then collect chunk
-// i-1 (buffer pair (i-1)%2), dedup it and hand it to the LZW thread while chunk i runs on the FPGA.
-// Buffer pair i%2 is free when chunk i is copied in: its previous chunk (i-2) was collected in iteration i-1.
+// Batched + double-buffered (default). Iteration i: fill batch i (buffer pair i%2) from Ring1 until it holds
+// SHA_BATCH_MAX_CHUNKS chunks or Ring1 is finished, submit it, then collect batch i-1 (buffer pair (i-1)%2):
+// dedup its chunks in order and hand them to the LZW thread while batch i runs on the FPGA.
+// Buffer pair i%2 is free when batch i is filled: its previous batch (i-2) was collected in iteration i-1.
+static ShaBatch Batch[NBUF];
+
+static void collect_batch(int k) {           // SHA thread: finish batch k, dedup it, push its chunks to Ring2
+	const ShaBatch& B = Batch[k];
+	Sha_stage_timer.start();
+	Sha_timer.start();
+	fpga_wait(k, B.n);
+	Sha_timer.stop();
+	Sha_stage_timer.stop();
+	for (uint32_t c = 0; c < B.n; c++) {
+		Sha_stage_timer.start();
+		Digest dg;
+		Sha_timer.start();
+		batch_digest(B, k, c, dg.b);
+		Sha_timer.stop();
+		Ring2Slot& out = Ring2.slots[Ring2.tail];   // always free: commit_and_advance() waits until it is
+		out.len = B.len[c];
+		out.dup = dedup_chunk(dg, out.len, &out.dup_idx);
+		if (!out.dup) memcpy(out.data, Fpga->in_ptr[k] + B.off[c], out.len);   // the kernel only reads in_buf
+		Sha_stage_timer.stop();
+		Ring2_full_timer.start();
+		Ring2.commit_and_advance();           // blocks only while Ring2 is full
+		Ring2_full_timer.stop();
+	}
+}
+
 static void sha_worker_overlap() {
-	uint32_t flen[NBUF] = {0, 0};
-	int k = 0;                                // buffer pair for the next chunk
-	int prev = -1;                            // buffer pair of the chunk in flight, or -1
-	for (;;) {
-		int idx = Ring1.acquire_read();
-		if (idx >= 0) {
+	int k = 0;                                // buffer pair for the next batch
+	int prev = -1;                            // buffer pair of the batch in flight, or -1
+	bool finished = false;
+	while (!finished) {
+		ShaBatch& B = Batch[k];
+		B.n = 0;
+		B.data_words = 0;
+		while (B.n < SHA_BATCH_MAX_CHUNKS) {  // fill the batch
+			int idx = Ring1.acquire_read();
+			if (idx < 0) { finished = true; break; }   // Ring1 finished and empty
 			Sha_stage_timer.start();
-			uint32_t len = Ring1.slots[idx].len;
 			Sha_timer.start();
-			memcpy(Fpga->in_ptr[k], Ring1.slots[idx].data, len);
+			batch_add(B, k, Ring1.slots[idx].data, Ring1.slots[idx].len);
+			Sha_timer.stop();
+			Sha_stage_timer.stop();
 			Ring1.release_read();             // the chunk now lives in the FPGA buffer: CDC can reuse the slot
-			fpga_submit(k, len);
-			Sha_timer.stop();
-			flen[k] = len;
-			Sha_stage_timer.stop();
 		}
-		if (prev >= 0) {                      // previous chunk: finishes on the FPGA, then dedup + hand to LZW
+		bool submitted = B.n > 0;
+		if (submitted) {
 			Sha_stage_timer.start();
-			Digest dg;
 			Sha_timer.start();
-			fpga_collect(prev, flen[prev], dg.b);
+			fpga_submit(k, B.n);
 			Sha_timer.stop();
-			ChunkSlot& out = Ring2.slots[Ring2.tail];   // always free: commit_and_advance() waits until it is
-			out.len = flen[prev];
-			out.dup = dedup_chunk(dg, out.len, &out.dup_idx);
-			if (!out.dup) memcpy(out.data, Fpga->in_ptr[prev], out.len);   // the kernel only reads in_buf
 			Sha_stage_timer.stop();
-			Ring2_full_timer.start();
-			Ring2.commit_and_advance();       // blocks only while Ring2 is full
-			Ring2_full_timer.stop();
 		}
-		if (idx < 0) break;                   // Ring1 finished and empty, last chunk collected
-		prev = k;
+		if (prev >= 0) collect_batch(prev);   // previous batch: finishes on the FPGA, then dedup + hand to LZW
+		prev = submitted ? k : -1;
 		k = (k + 1) % NBUF;
 	}
-	Ring2.finish();                           // tell the LZW thread no more chunks are coming
+	if (prev >= 0) collect_batch(prev);       // last batch
+	Ring2.finish();                           // tell the LZW threads no more chunks are coming
 }
 
-static void lzw_worker() {
+static void lzw_worker(int id) {
+	LzwWorker& W = Lzw_workers[id];
 	for (;;) {
-		int idx = Ring2.acquire_read();
-		if (idx < 0) break;                   // Ring2 finished and empty
-		Lzw_stage_timer.start();
-		const ChunkSlot& s = Ring2.slots[idx];
-		lzw_chunk(s.data, s.len, s.dup, s.dup_idx);
-		Lzw_stage_timer.stop();
-		Ring2.release_read();
+		int idx = Ring2.claim_next();
+		if (idx < 0) break;                   // Ring2 finished and every chunk claimed
+		W.stage_timer.start();
+		Ring2Slot& s = Ring2.slots[idx];
+		s.out_len = lzw_record(W, s.data, s.len, s.dup, s.dup_idx, s.out);
+		W.chunks++;
+		Ring2.finish_slot(idx);               // in-order append to Output (may append other workers' records too)
+		W.stage_timer.stop();
 	}
 }
 
@@ -712,16 +849,21 @@ int main(int argc, char* argv[]) {
 	server.setup_server(blocksize);
 
 	std::thread sha_thread(overlap_mode() ? sha_worker_overlap : sha_worker_seq);   // stage 2: SHA + dedup
-	std::thread lzw_thread(lzw_worker);       // pipeline stage 3: LZW + output
+	std::vector<std::thread> lzw_threads;     // pipeline stage 3: LZW + output, cores 2, 3, ...
+	for (int i = 0; i < NUM_LZW_WORKERS; i++) lzw_threads.emplace_back(lzw_worker, i);
 	pin_to_cpu(pthread_self(), 0);            // this thread: recvfrom + CDC
 	pin_to_cpu(sha_thread.native_handle(), 1);
-	pin_to_cpu(lzw_thread.native_handle(), 2);
+	for (int i = 0; i < NUM_LZW_WORKERS; i++) pin_to_cpu(lzw_threads[i].native_handle(), 2 + i);
 
-	total_timer.start();
+	bool first_packet = true;
 	while (!done) {
-		ethernet_timer.start();
+		if (!first_packet) ethernet_timer.start();
 		server.get_packet(input[writer]);
-		ethernet_timer.stop();
+		if (!first_packet) ethernet_timer.stop();
+		if (first_packet) {                  // clocks start once data is actually flowing
+			total_timer.start();
+			first_packet = false;
+		}
 
 		unsigned char* buffer = input[writer];
 		done = buffer[1] & DONE_BIT_L;
@@ -744,8 +886,12 @@ int main(int argc, char* argv[]) {
 	Push_timer.stop();
 	Ring1.finish();                           // no more chunks: SHA thread drains Ring1, then finishes Ring2
 	sha_thread.join();
-	lzw_thread.join();                        // LZW thread drains Ring2 and exits
+	for (auto& t : lzw_threads) t.join();     // LZW threads drain Ring2 and exit
 	total_timer.stop();
+	for (int i = 0; i < NUM_LZW_WORKERS; i++) {
+		Uniq_bytes    += Lzw_workers[i].uniq_bytes;
+		Lzw_out_bytes += Lzw_workers[i].out_bytes;
+	}
 
 	FILE *outfd = fopen(outname, "wb");
 	if (outfd == NULL) { printf("cannot open %s\n", outname); return 1; }
@@ -771,27 +917,35 @@ int main(int argc, char* argv[]) {
 	       (unsigned long long) Uniq_bytes, (unsigned long long) Lzw_out_bytes,
 	       Lzw_out_bytes ? (double) Uniq_bytes / Lzw_out_bytes : 0.0);
 
-	float sha_ms = Sha_timer.latency(), dedup_ms = Dedup_timer.latency(), lzw_ms = Lzw_timer.latency();
+	float sha_ms = Sha_timer.latency(), dedup_ms = Dedup_timer.latency();
 	float handoff_ms = Ring_full_timer.latency();
 	float cdc_ms = Push_timer.latency() - handoff_ms;          // main thread, CDC only
 	float sha_stage_ms = Sha_stage_timer.latency();            // SHA thread busy time
-	float lzw_stage_ms = Lzw_stage_timer.latency();            // LZW thread busy time
+	float lzw_stage_ms = 0;                                    // busiest LZW thread (they run in parallel)
+	for (int i = 0; i < NUM_LZW_WORKERS; i++)
+		if (Lzw_workers[i].stage_timer.latency() > lzw_stage_ms) lzw_stage_ms = Lzw_workers[i].stage_timer.latency();
 	float compute_ms = cdc_ms;                                 // stages overlap: the slowest one bounds throughput
 	if (sha_stage_ms > compute_ms) compute_ms = sha_stage_ms;
 	if (lzw_stage_ms > compute_ms) compute_ms = lzw_stage_ms;
 	printf("--------------- Time breakdown (ms) ---------------\n");
 	printf("main thread: CDC %.2f | hand-off to SHA thread (incl. waiting on full Ring1) %.2f\n", cdc_ms, handoff_ms);
-	printf("SHA thread : SHA-256 %.2f | dedup %.2f | busy %.2f | hand-off to LZW thread (incl. waiting on full Ring2) %.2f\n",
+	printf("SHA thread : SHA-256 %.2f | dedup %.2f | busy %.2f | hand-off to LZW threads (incl. waiting on full Ring2) %.2f\n",
 	       sha_ms, dedup_ms, sha_stage_ms, Ring2_full_timer.latency());
-	printf("LZW thread : LZW %.2f | busy %.2f\n", lzw_ms, lzw_stage_ms);
+	for (int i = 0; i < NUM_LZW_WORKERS; i++)
+		printf("LZW thread %d (core %d): LZW %.2f | busy %.2f | %llu chunks\n", i, 2 + i,
+		       Lzw_workers[i].lzw_timer.latency(), Lzw_workers[i].stage_timer.latency(),
+		       (unsigned long long) Lzw_workers[i].chunks);
 	printf("end-to-end (first packet to last chunk processed): %.2f ms\n", total_timer.latency());
-	printf("SHA-256 on FPGA: %llu calls, kernel execution %.2f ms total (%.1f us avg); host-side SHA time above includes copies and OpenCL overhead\n",
-	       (unsigned long long) Fpga->calls, Fpga->kernel_ns / 1e6,
-	       Fpga->calls ? Fpga->kernel_ns / 1e3 / Fpga->calls : 0.0);
+	printf("SHA-256 on FPGA: %llu kernel calls for %llu chunks (%.1f chunks/call), kernel execution %.2f ms total (%.1f us avg per call, %.1f us per chunk); host-side SHA time above includes copies and OpenCL overhead\n",
+	       (unsigned long long) Fpga->calls, (unsigned long long) Fpga->chunks,
+	       Fpga->calls ? (double) Fpga->chunks / Fpga->calls : 0.0, Fpga->kernel_ns / 1e6,
+	       Fpga->calls ? Fpga->kernel_ns / 1e3 / Fpga->calls : 0.0,
+	       Fpga->chunks ? Fpga->kernel_ns / 1e3 / Fpga->chunks : 0.0);
 	printf("SHA mode: %s | SHA thread waited on the FPGA %.2f ms\n",
 	       Use_rw ? "sequential (-r)" : No_overlap ? "sequential (-n)" :
-	       Fpga->out_of_order ? "double-buffered, out-of-order queue" : "double-buffered, in-order queue",
+	       Fpga->out_of_order ? "batched + double-buffered, out-of-order queue" : "batched + double-buffered, in-order queue",
 	       Fpga_wait_timer.latency());
+	if (overlap_mode()) printf("SHA batch size: up to %d chunks per kernel call\n", SHA_BATCH_MAX_CHUNKS);
 	printf("OpenCL setup (excluded from run time): %.2f ms\n", opencl_timer.latency());
 	if (Check_sha)
 		printf("SHA check: %llu of %llu FPGA digests differ from software (%llu all-zero, %llu identical to the previous digest)\n",
