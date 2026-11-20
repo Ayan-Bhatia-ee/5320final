@@ -12,7 +12,7 @@ extern "C" {
 // input_data    : chunk bytes, read 8 at a time (host buffer is MAX_CHUNK_SIZE bytes)
 // output_digest : 32-byte SHA-256 digest, standard big-endian byte order
 // length        : chunk length in bytes, <= MAX_CHUNK_SIZE
-void sha256_kernel(const uint64_t* input_data, uint8_t* output_digest, uint32_t length);
+void sha256_kernel(const uint32_t* input_data, uint32_t* output_digest, uint32_t length);
 }
 
 #endif // SHA_KERNEL_H_
